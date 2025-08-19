@@ -412,7 +412,7 @@ int main(int argc, char **argv){
   for(int i=0; i<total_requests; i++){
     uint8_t *src = (uint8_t *)&srcs[i * buf_size];
     uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
-    uint8_t *cpy_dst = (uint8_t *)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    void **cpy_dst = (void **)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     int *mean_vec = (int *)&mean_vector[i * buf_size];
 
     idxd_comp *m_comp = &comp[i];
@@ -434,8 +434,8 @@ int main(int argc, char **argv){
     pointer_chain[indices[len - 1] * 8] = (void *)&cpy_dst[indices[0] * 8];
 
     memcpy((void *)cpy_dst, (void *)src, buf_size);
-    for(int i=0; i<buf_size; i+=64){
-      printf("cpy_dst[%lx] = %lx\n", (uintptr_t)(cpy_dst + i), (uintptr_t)&(cpy_dst[i]));
+    for(int i=0; i<buf_size; i+=8){
+      printf("cpy_dst: 0x%lx = 0x%lx\n", (uintptr_t)(cpy_dst + i), (uintptr_t)(cpy_dst[i]));
     }
 
     chase_pointers((void **)cpy_dst, buf_size/64);
