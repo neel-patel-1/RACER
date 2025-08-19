@@ -434,9 +434,9 @@ int main(int argc, char **argv){
     random_permutation(indices, len);
     for(int i=1; i<len; ++i){
       /* pchain at the last index equals the address of the st of the cacheline at the next index*/
-      pointer_chain[indices[i-1] * 8] = (void *)&dst[indices[i] * 8];
+      pointer_chain[indices[i-1] * 8] = (void *)&cpy_dst[indices[i] * 8];
     }
-    pointer_chain[indices[len - 1] * 8] = (void *)&dst[indices[0] * 8];
+    pointer_chain[indices[len - 1] * 8] = (void *)&cpy_dst[indices[0] * 8];
 
     /* Core Phase 1*/
     #ifdef EXETIME
@@ -502,10 +502,6 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       end = rdtsc();
       #endif
-      if(avDSz != decomp_size){
-        LOG_PRINT(LOG_ERR, "Decompression failed: %lu\n", avDSz);
-        return -1;
-      }
     }
 
     #ifdef EXETIME
@@ -516,11 +512,11 @@ int main(int argc, char **argv){
 
     if(sync_prefetch){
       LOG_PRINT(LOG_TOO_VERBOSE, "Sync prefetch real buffers\n");
-      char *fetch_buf = (char *)dst;
+      char *fetch_buf = (char *)cpy_dst;
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      for(int j=0; j<decomp_size; j+=64){
+      for(int j=0; j<buf_size; j+=64){
         _mm_prefetch((void *)(fetch_buf + j), _MM_HINT_T1);
       }
       #ifdef EXETIME
