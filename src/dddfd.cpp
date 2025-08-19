@@ -208,7 +208,7 @@ static __always_inline void flush_range(void *start, size_t len)
   }
 }
 
-static __always_inline void demote_buf(char *buf, int size){
+static __always_inline void demote1_buf(char *buf, int size){
   for(int i = 0; i < size; i+=64){
     _cldemote((void *)&buf[i]);
   }
@@ -264,20 +264,30 @@ int main(int argc, char **argv){
   uint64_t phase1_array_start[total_requests];
   uint64_t phase1_array_end[total_requests];
 
-  uint64_t demote_array_start[total_requests];
-  uint64_t demote_array_end[total_requests];
-  uint64_t memcpy_array_start[total_requests];
-  uint64_t memcpy_array_end[total_requests];
+  uint64_t demote1_array_start[total_requests];
+  uint64_t demote1_array_end[total_requests];
+  uint64_t phase2_array_start[total_requests];
+  uint64_t phase2_array_end[total_requests];
 
-  uint64_t pref_array_start[total_requests];
-  uint64_t pref_array_end[total_requests];
-  uint64_t dotprod_array_start[total_requests];
-  uint64_t dotprod_array_end[total_requests];
+  uint64_t pref1_array_start[total_requests];
+  uint64_t pref1_array_end[total_requests];
+  uint64_t phase3_array_start[total_requests];
+  uint64_t phase3_array_end[total_requests];
 
-  memset(demote_array_end, 0, sizeof(uint64_t) * total_requests);
-  memset(demote_array_start, 0, sizeof(uint64_t) * total_requests);
-  memset(pref_array_end, 0, sizeof(uint64_t) * total_requests);
-  memset(pref_array_start, 0, sizeof(uint64_t) * total_requests);
+  uint64_t demote2_array_start[total_requests];
+  uint64_t demote2_array_end[total_requests];
+  uint64_t phase4_array_start[total_requests];
+  uint64_t phase4_array_end[total_requests];
+
+  uint64_t pref2_array_start[total_requests];
+  uint64_t pref2_array_end[total_requests];
+  uint64_t phase5_array_start[total_requests];
+  uint64_t phase5_array_end[total_requests];
+
+  memset(demote1_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(demote1_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(pref1_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(pref1_array_start, 0, sizeof(uint64_t) * total_requests);
 
 
   uint64_t diffs[total_requests];
@@ -404,16 +414,16 @@ for(int j=0; j<iter; j++){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      demote_buf((char *)decry_buf, decomp_size);
+      demote1_buf((char *)decry_buf, decomp_size);
       #ifdef EXETIME
       end = rdtsc();
-      demote_array_end[i] = end;
-      demote_array_start[i] = start;
+      demote1_array_end[i] = end;
+      demote1_array_start[i] = start;
       #endif
     } else {
       #ifdef EXETIME
-      demote_array_end[i] = 0;
-      demote_array_start[i] = 0;
+      demote1_array_end[i] = 0;
+      demote1_array_start[i] = 0;
       #endif
     }
 
@@ -459,8 +469,8 @@ for(int j=0; j<iter; j++){
     }
 
     #ifdef EXETIME
-    memcpy_array_start[i] = start;
-    memcpy_array_end[i] = end;
+    phase2_array_start[i] = start;
+    phase2_array_end[i] = end;
     #endif
 
 
@@ -475,8 +485,8 @@ for(int j=0; j<iter; j++){
       }
       #ifdef EXETIME
       end = rdtsc();
-      pref_array_start[i] = start;
-      pref_array_end[i] = end;
+      pref1_array_start[i] = start;
+      pref1_array_end[i] = end;
     #endif
     }
 
@@ -490,8 +500,8 @@ for(int j=0; j<iter; j++){
       #endif
 
     #ifdef EXETIME
-    dotprod_array_start[i] = start;
-    dotprod_array_end[i] = end;
+    phase3_array_start[i] = start;
+    phase3_array_end[i] = end;
     #endif
   }
 #ifdef THROUGHPUT
@@ -514,10 +524,10 @@ mean_median_stdev_rps(exe_time_diffs, iter, total_requests, " RPS");
   uint64_t SwPrftchAvg;
   uint64_t DotProdAvg;
   avg_samples_from_arrays(diffs,phase1Avg, phase1_array_end, phase1_array_start, total_requests);
-  avg_samples_from_arrays(diffs,MemcpyAvg, memcpy_array_end, memcpy_array_start, total_requests);
-  avg_samples_from_arrays(diffs,DemoteAvg, demote_array_end, demote_array_start, total_requests);
-  avg_samples_from_arrays(diffs,SwPrftchAvg, pref_array_end, pref_array_start, total_requests);
-  avg_samples_from_arrays(diffs,DotProdAvg, dotprod_array_end, dotprod_array_start, total_requests);
+  avg_samples_from_arrays(diffs,MemcpyAvg, phase2_array_end, phase2_array_start, total_requests);
+  avg_samples_from_arrays(diffs,DemoteAvg, demote1_array_end, demote1_array_start, total_requests);
+  avg_samples_from_arrays(diffs,SwPrftchAvg, pref1_array_end, pref1_array_start, total_requests);
+  avg_samples_from_arrays(diffs,DotProdAvg, phase3_array_end, phase3_array_start, total_requests);
 
   PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg );
   #endif
