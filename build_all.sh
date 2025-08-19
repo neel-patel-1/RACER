@@ -33,6 +33,6 @@ sudo make install -j
 
 cd $ROOT/third-party/ipp-crypto
 git submodule update --init --recursive .
-ASM_NASM=/usr/bin/nasm cmake CMakeLists.txt -B_build -DARCH=intel64 -DCMAKE_BUILD_TYPE=Release
+ASM_NASM=/usr/local/bin/nasm cmake CMakeLists.txt -B_build -DARCH=intel64 -DCMAKE_BUILD_TYPE=Release
 cd _build/
 make -j $(( $(nproc) / 2 ))
