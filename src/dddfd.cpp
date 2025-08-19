@@ -261,12 +261,14 @@ int main(int argc, char **argv){
   uint64_t max_comp_size = get_compress_bound(decomp_size);
   uint64_t max_payload_expansion = max_comp_size + 64;
 
-  uint64_t memcpy_array_start[total_requests];
-  uint64_t memcpy_array_end[total_requests];
-  uint64_t preproc_array_start[total_requests];
+  uint64_t phase1_array_start[total_requests];
+  uint64_t phase1_array_end[total_requests];
+
   uint64_t demote_array_start[total_requests];
   uint64_t demote_array_end[total_requests];
-  uint64_t preproc_array_end[total_requests];
+  uint64_t memcpy_array_start[total_requests];
+  uint64_t memcpy_array_end[total_requests];
+
   uint64_t pref_array_start[total_requests];
   uint64_t pref_array_end[total_requests];
   uint64_t dotprod_array_start[total_requests];
@@ -393,8 +395,8 @@ for(int j=0; j<iter; j++){
     continue;
 
     #ifdef EXETIME
-    preproc_array_start[i] = start;
-    preproc_array_end[i] = end;
+    phase1_array_start[i] = start;
+    phase1_array_end[i] = end;
     #endif
 
     /* Acc Phase 1*/
@@ -506,18 +508,18 @@ mean_median_stdev_rps(exe_time_diffs, iter, total_requests, " RPS");
 #endif
 
   #ifdef EXETIME
-  uint64_t PreProcAvg;
+  uint64_t phase1Avg;
   uint64_t MemcpyAvg;
   uint64_t DemoteAvg;
   uint64_t SwPrftchAvg;
   uint64_t DotProdAvg;
-  avg_samples_from_arrays(diffs,PreProcAvg, preproc_array_end, preproc_array_start, total_requests);
+  avg_samples_from_arrays(diffs,phase1Avg, phase1_array_end, phase1_array_start, total_requests);
   avg_samples_from_arrays(diffs,MemcpyAvg, memcpy_array_end, memcpy_array_start, total_requests);
   avg_samples_from_arrays(diffs,DemoteAvg, demote_array_end, demote_array_start, total_requests);
   avg_samples_from_arrays(diffs,SwPrftchAvg, pref_array_end, pref_array_start, total_requests);
   avg_samples_from_arrays(diffs,DotProdAvg, dotprod_array_end, dotprod_array_start, total_requests);
 
-  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n",PreProcAvg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg );
+  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg );
   #endif
 
 
