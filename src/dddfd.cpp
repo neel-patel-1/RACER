@@ -448,7 +448,12 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-
+      gpcore_do_decompress(
+        (void *)dst,
+        (void *)&(req.value()[0]),
+        req.value().size(),
+        &avDSz
+      );
       #ifdef EXETIME
       end = rdtsc();
       #endif
@@ -494,18 +499,6 @@ int main(int argc, char **argv){
     phase3_array_end[i] = end;
     #endif
   }
-#ifdef THROUGHPUT
-  end = rdtsc();
-  start_times[j] = start;
-  end_times[j] = end;
-}
-uint64_t exe_time_diffs[iter];
-uint64_t exe_times_avg;
-avg_samples_from_arrays(exe_time_diffs, exe_times_avg, end_times, start_times, iter);
-PRINT("%lu ", buf_size);
-mean_median_stdev_rps(exe_time_diffs, iter, total_requests, " RPS");
-
-#endif
 
   #ifdef EXETIME
   uint64_t phase1Avg;
