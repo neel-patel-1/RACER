@@ -393,7 +393,6 @@ int main(int argc, char **argv){
     #ifdef EXETIME
     end = rdtsc();
     #endif
-    continue;
 
     #ifdef EXETIME
     phase1_array_start[i] = start;
