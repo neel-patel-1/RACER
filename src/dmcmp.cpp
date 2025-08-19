@@ -263,6 +263,8 @@ int main(int argc, char **argv){
   int iaa_wq_id = 0;
   int wq_type = SHARED;
   int iaa_dev_id = 1;
+  int dsa_wq_id = 0;
+  int dsa_dev_id = 0;
 
   struct numa_mem  *nm = NULL;
   int nb_numa_node = 1;
@@ -396,6 +398,7 @@ int main(int argc, char **argv){
   memset(comp, 0, sizeof(idxd_comp) * total_requests);
   memset(desc, 0, sizeof(idxd_desc) * total_requests);
   initialize_iaa_wq(iaa_dev_id, iaa_wq_id, wq_type);
+  initialize_dsa_wq(dsa_dev_id, dsa_wq_id, wq_type);
 
   /* pin to SMT threads on same core */
   cpu_pin(3);
@@ -432,14 +435,6 @@ int main(int argc, char **argv){
       pointer_chain[indices[i-1] * 8] = (void *)&cpy_dst[indices[i] * 8];
     }
     pointer_chain[indices[len - 1] * 8] = (void *)&cpy_dst[indices[0] * 8];
-
-    memcpy((void *)cpy_dst, (void *)src, buf_size);
-    for(int i=0; i<buf_size; i+=8){
-      printf("cpy_dst: 0x%lx = 0x%lx\n", (uintptr_t)(cpy_dst + i), (uintptr_t)(cpy_dst[i]));
-    }
-
-    chase_pointers((void **)cpy_dst, buf_size/64);
-    return;
 
     /* Core Phase 1*/
     #ifdef EXETIME
