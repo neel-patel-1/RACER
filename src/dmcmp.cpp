@@ -416,16 +416,27 @@ int main(int argc, char **argv){
   prefault_pages((void *)dsts_2, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush source, write prefault dsat dsts */
 
   for(int i=0; i<total_requests; i++){
-    uint8_t *src = (uint8_t *)&srcs[i * max_payload_expansion];
+    uint8_t *src = (uint8_t *)&srcs[i * buf_size];
     uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     uint8_t *cpy_dst = (uint8_t *)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
 
-    uint8_t *m_aecs = (uint8_t *)&aecs[i * IAA_FILTER_AECS_SIZE * 2];
-
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
-    router::RouterRequest req;
     p_off = (p_off + 64) % 4096;
+
+    void **pointer_chain = (void **)&srcs[i * buf_size];
+    uint64_t len = buf_size / 64;
+    uint64_t  *indices = (uint64_t *)malloc(sizeof(uint64_t) * len);
+    for (int i = 0; i < len; i++) {
+      indices[i] = i;
+    }
+
+    random_permutation(indices, len);
+    for(int i=1; i<len; ++i){
+      /* pchain at the last index equals the address of the st of the cacheline at the next index*/
+      pointer_chain[indices[i-1] * 8] = (void *)&dst[indices[i] * 8];
+    }
+    pointer_chain[indices[len - 1] * 8] = (void *)&dst[indices[0] * 8];
 
     /* Core Phase 1*/
     #ifdef EXETIME
@@ -448,7 +459,7 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      demote_buf((char *)&(req.value()[0]), decomp_size);
+      demote_buf((char *)src, buf_size);
       #ifdef EXETIME
       end = rdtsc();
       demote1_array_end[i] = end;
@@ -464,7 +475,7 @@ int main(int argc, char **argv){
     if(!noAcc){
       /* offload memcpy to dsa */
       prepare_dsa_memcpy_desc_with_preallocated_comp(m_desc,
-        (uint64_t)dst, (uint64_t)cpy_dst, (uint64_t)m_comp, buf_size);
+        (uint64_t)src, (uint64_t)cpy_dst, (uint64_t)m_comp, buf_size);
       while(enqcmd((void *)((char *)(dsa->wq_reg) + p_off), m_desc) ){
         /* retry submit */
       }
@@ -487,7 +498,7 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      memcpy((void *)cpy_dst, (void *)dst, buf_size);
+      memcpy((void *)cpy_dst, (void *)src, buf_size);
       #ifdef EXETIME
       end = rdtsc();
       #endif
@@ -522,7 +533,7 @@ int main(int argc, char **argv){
     #ifdef EXETIME
     start = rdtsc();
     #endif
-    chase_pointers((void **)dst, buf_size/64);
+    chase_pointers((void **)cpy_dst, buf_size/64);
     LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
     #ifdef EXETIME
     end = rdtsc();
