@@ -343,6 +343,7 @@ int main(int argc, char **argv){
 
   int ippAES_GCM_ctx_size;
   IppStatus status;
+  int *mean_vector = NULL;
 
   status = ippsAES_GCMGetSize(&ippAES_GCM_ctx_size);
   if(status != ippStsNoErr){
@@ -377,6 +378,7 @@ int main(int argc, char **argv){
   dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
   dsts_2 = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
   aecs = (uint8_t *)alloc_numa_offset(nm, IAA_FILTER_AECS_SIZE * 2 * total_requests, 0);
+  mean_vector = (int *)alloc_numa_offset(nm, sizeof(int) * total_requests * buf_size, 0);
 
 
   rc = alloc_numa_mem(nm, pg_size, node);
@@ -390,6 +392,7 @@ int main(int argc, char **argv){
   add_base_addr(nm, (void **)&desc);
   add_base_addr(nm, (void **)&comp);
   add_base_addr(nm, (void **)&aecs);
+  add_base_addr(nm, (void **)&mean_vector);
   memset(comp, 0, sizeof(idxd_comp) * total_requests);
   memset(desc, 0, sizeof(idxd_desc) * total_requests);
   initialize_iaa_wq(iaa_dev_id, iaa_wq_id, wq_type);
@@ -400,18 +403,9 @@ int main(int argc, char **argv){
   uint64_t buf_offset = 0;
 
   int avail_out;
-  gen_ser_comp_payload((char *)srcs, buf_size,
-    max_comp_size, max_payload_expansion,
-    &avail_out, target_ratio);
-  LOG_PRINT(LOG_DEBUG, "ser'd bufsize: %d\n", avail_out);
-
-  for(int i=1; i<total_requests; i++){
-    memcpy((void *)&srcs[i * max_payload_expansion], (void *)srcs, avail_out);
-  }
-
-  uLong avDSz = IAA_DECOMPRESS_MAX_DEST_SIZE;
 
   flush_range((void *)srcs, max_payload_expansion * total_requests);
+  prefault_pages((void *)dsts, IAA_DECOMPRESS_MAX_DEST_SIZE  * total_requests); /* flush source, write prefault srcs */
   flush_range((void *)dsts, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush decrypt dsts */
   prefault_pages((void *)dsts_2, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush source, write prefault dsat dsts */
 
@@ -419,6 +413,7 @@ int main(int argc, char **argv){
     uint8_t *src = (uint8_t *)&srcs[i * buf_size];
     uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     uint8_t *cpy_dst = (uint8_t *)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    int *mean_vec = (int *)&mean_vector[i * buf_size];
 
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
@@ -437,6 +432,14 @@ int main(int argc, char **argv){
       pointer_chain[indices[i-1] * 8] = (void *)&cpy_dst[indices[i] * 8];
     }
     pointer_chain[indices[len - 1] * 8] = (void *)&cpy_dst[indices[0] * 8];
+
+    memcpy((void *)cpy_dst, (void *)src, buf_size);
+    for(int i=0; i<buf_size; i+=64){
+      printf("cpy_dst[%lx] = %lx\n", (uintptr_t)(cpy_dst + i), (uintptr_t)&(cpy_dst[i]));
+    }
+
+    chase_pointers((void **)cpy_dst, buf_size/64);
+    return;
 
     /* Core Phase 1*/
     #ifdef EXETIME
@@ -558,8 +561,13 @@ int main(int argc, char **argv){
     }
 
     if(!noAcc){
-      prepare_iaa_filter_desc_with_preallocated_comp(
-        m_desc, (uint64_t)dst, (uint64_t)filter_dst, (uint64_t)m_comp, decomp_size);
+      prepare_dsa_memfill_desc_with_preallocated_comp(
+          m_desc,
+          0,
+          (uint64_t )(cpy_dst),
+          (uint64_t)m_comp,
+          buf_size
+      );
       while(enqcmd((void *)((char *)(iaa->wq_reg) + p_off), m_desc)){
       }
       #ifdef EXETIME
@@ -579,13 +587,7 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      gpcore_do_extract(
-        dst,
-        filter_dst,
-        0,
-        decomp_size,
-        m_aecs
-      );
+      memset(cpy_dst, 0, buf_size);
       #ifdef EXETIME
       end = rdtsc();
       #endif
@@ -597,7 +599,7 @@ int main(int argc, char **argv){
 
     if(sync_prefetch){
       LOG_PRINT(LOG_TOO_VERBOSE, "Sync prefetch filtered buffers\n");
-      char *fetch_buf = (char *)filter_dst;
+      char *fetch_buf = (char *)cpy_dst;
       #ifdef EXETIME
       start = rdtsc();
       #endif
@@ -616,7 +618,12 @@ int main(int argc, char **argv){
     #ifdef EXETIME
     start = rdtsc();
     #endif
-    dotproduct((void *)filter_dst, (void *)&score, buf_size/2, &sz);
+    calc_mean(
+      (int *)cpy_dst,
+      (int *)mean_vec,
+      buf_size,
+      buf_size
+    );
 
     #ifdef EXETIME
     end = rdtsc();
