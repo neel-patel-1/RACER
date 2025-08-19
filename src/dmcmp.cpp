@@ -563,7 +563,7 @@ int main(int argc, char **argv){
           (uint64_t)m_comp,
           buf_size
       );
-      while(enqcmd((void *)((char *)(iaa->wq_reg) + p_off), m_desc)){
+      while(enqcmd((void *)((char *)(dsa->wq_reg) + p_off), m_desc)){
       }
       #ifdef EXETIME
       start = rdtsc();
