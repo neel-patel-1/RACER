@@ -368,38 +368,41 @@ for(int j=0; j<iter; j++){
   flush_range((void *)emul_dymmy_buf, buf_size * total_requests);
 
   for(int i=0; i<total_requests; i++){
-    char *decrypt_src = (char *)&srcs[i * max_payload_expansion];
-    char *decrypt_dst = (char *)&dsa_dsts[i * max_payload_expansion];
-    void **dst = (void **)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
-    void **cpy_dst = (void **)&dsa_dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
-    router::RouterRequest req;
     p_off = (p_off + 64) % 4096;
 
-      #ifdef EXETIME
-      start = rdtsc();
-      #endif
+    void *encry_buf;
+    void *decry_buf;
 
-      decrypt_feature((void *)decrypt_src, (void *)decrypt_dst, max_payload_expansion);
-      // req.ParseFromArray((void *)src, avail_out);
-      // LOG_PRINT(LOG_TOO_VERBOSE, "Deserialized: %lu\n", req.value().length());
+    void *comp_buf;
+    void *decomp_buf;
 
-      #ifdef EXETIME
-      end = rdtsc();
-      #endif
-      continue;
+    int comp_buf_size = 0;
+
+    encry_buf = (void *)&srcs[i * max_payload_expansion];
+    /* Core Phase 1*/
+    #ifdef EXETIME
+    start = rdtsc();
+    #endif
+
+
+    #ifdef EXETIME
+    end = rdtsc();
+    #endif
+    continue;
 
     #ifdef EXETIME
     preproc_array_start[i] = start;
     preproc_array_end[i] = end;
     #endif
 
+    /* Acc Phase 1*/
     if(sync_demote){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      demote_buf((char *)&(req.value()[0]), decomp_size);
+      demote_buf((char *)decry_buf, decomp_size);
       #ifdef EXETIME
       end = rdtsc();
       demote_array_end[i] = end;
@@ -415,8 +418,8 @@ for(int j=0; j<iter; j++){
     if(!noAcc){
       /* offload memcpy to dsa */
       prepare_iaa_decompress_desc_with_preallocated_comp(
-        m_desc, (uint64_t)(&(req.value())[0]), (uint64_t)dst,
-        (uint64_t)(m_comp), req.value().size());
+        m_desc, (uint64_t)(comp_buf), (uint64_t)decomp_buf,
+        (uint64_t)(m_comp), comp_buf_size);
       while(enqcmd((void *)((char *)(iaa->wq_reg) + p_off), m_desc) ){
         /* retry submit */
       }
@@ -443,12 +446,7 @@ for(int j=0; j<iter; j++){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      gpcore_do_decompress(
-        (void *)dst,
-        (void *)&(req.value()[0]),
-        req.value().size(),
-        &avDSz
-      );
+
       #ifdef EXETIME
       end = rdtsc();
       #endif
@@ -466,7 +464,7 @@ for(int j=0; j<iter; j++){
 
     if(sync_prefetch){
       LOG_PRINT(LOG_TOO_VERBOSE, "Sync prefetch real buffers\n");
-      char *fetch_buf = (char *)dst;
+      char *fetch_buf = (char *)decomp_buf;
       #ifdef EXETIME
       start = rdtsc();
       #endif
@@ -481,11 +479,10 @@ for(int j=0; j<iter; j++){
     }
 
       uint32_t hash;
-      LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
+      LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)decomp_buf);
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      hash = furc_hash((char *)dst, decomp_size, 16);
       #ifdef EXETIME
       end = rdtsc();
       #endif
