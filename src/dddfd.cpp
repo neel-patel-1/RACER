@@ -607,16 +607,18 @@ int main(int argc, char **argv){
   uint64_t DemoteAvg;
   uint64_t SwPrftchAvg;
   uint64_t DotProdAvg;
+  uint64_t Demote2Avg;
   uint64_t phase4Avg;
   avg_samples_from_arrays(diffs,phase1Avg, phase1_array_end, phase1_array_start, total_requests);
   avg_samples_from_arrays(diffs,MemcpyAvg, phase2_array_end, phase2_array_start, total_requests);
   avg_samples_from_arrays(diffs,DemoteAvg, demote1_array_end, demote1_array_start, total_requests);
   avg_samples_from_arrays(diffs,SwPrftchAvg, pref1_array_end, pref1_array_start, total_requests);
   avg_samples_from_arrays(diffs,DotProdAvg, phase3_array_end, phase3_array_start, total_requests);
+  avg_samples_from_arrays(diffs,Demote2Avg, demote2_array_end, demote2_array_start, total_requests);
   avg_samples_from_arrays(diffs,phase4Avg, phase4_array_end, phase4_array_start, total_requests);
 
 
-  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg, phase4Avg);
+  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg, Demote2Avg, phase4Avg);
   #endif
 
 
