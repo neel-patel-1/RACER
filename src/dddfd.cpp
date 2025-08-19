@@ -418,7 +418,7 @@ int main(int argc, char **argv){
   for(int i=0; i<total_requests; i++){
     uint8_t *src = (uint8_t *)&srcs[i * max_payload_expansion];
     uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
-    void **filter_dst = (void **)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    uint8_t *filter_dst = (uint8_t *)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
 
     uint8_t *m_aecs = (uint8_t *)&aecs[i * IAA_FILTER_AECS_SIZE * 2];
 
@@ -583,10 +583,10 @@ int main(int argc, char **argv){
       start = rdtsc();
       #endif
       gpcore_do_extract(
-        src,
         dst,
+        filter_dst,
         0,
-        buf_size / 2,
+        decomp_size,
         m_aecs
       );
       #ifdef EXETIME
@@ -598,6 +598,34 @@ int main(int argc, char **argv){
     phase4_array_end[i] = end;
     #endif
 
+    if(sync_prefetch){
+      LOG_PRINT(LOG_TOO_VERBOSE, "Sync prefetch filtered buffers\n");
+      char *fetch_buf = (char *)filter_dst;
+      #ifdef EXETIME
+      start = rdtsc();
+      #endif
+      for(int j=0; j<decomp_size; j+=64){
+        _mm_prefetch((void *)(fetch_buf + j), _MM_HINT_T1);
+      }
+      #ifdef EXETIME
+      end = rdtsc();
+      pref2_array_start[i] = start;
+      pref2_array_end[i] = end;
+      #endif
+    }
+
+    float score;
+    int sz;
+    #ifdef EXETIME
+    start = rdtsc();
+    #endif
+    dotproduct((void *)filter_dst, (void *)&score, buf_size/2, &sz);
+
+    #ifdef EXETIME
+    end = rdtsc();
+    phase5_array_end[i] = end;
+    phase5_array_start[i] = start;
+    #endif
 
   }
 
@@ -609,6 +637,8 @@ int main(int argc, char **argv){
   uint64_t DotProdAvg;
   uint64_t Demote2Avg;
   uint64_t phase4Avg;
+  uint64_t Prefetch2Avg;
+  uint64_t phase5Avg;
   avg_samples_from_arrays(diffs,phase1Avg, phase1_array_end, phase1_array_start, total_requests);
   avg_samples_from_arrays(diffs,MemcpyAvg, phase2_array_end, phase2_array_start, total_requests);
   avg_samples_from_arrays(diffs,DemoteAvg, demote1_array_end, demote1_array_start, total_requests);
@@ -616,9 +646,11 @@ int main(int argc, char **argv){
   avg_samples_from_arrays(diffs,DotProdAvg, phase3_array_end, phase3_array_start, total_requests);
   avg_samples_from_arrays(diffs,Demote2Avg, demote2_array_end, demote2_array_start, total_requests);
   avg_samples_from_arrays(diffs,phase4Avg, phase4_array_end, phase4_array_start, total_requests);
+  avg_samples_from_arrays(diffs,Prefetch2Avg, pref2_array_end, pref2_array_start, total_requests);
+  avg_samples_from_arrays(diffs,phase5Avg, phase5_array_end, phase5_array_start, total_requests);
 
 
-  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg, Demote2Avg, phase4Avg);
+  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg, Demote2Avg, phase4Avg, Prefetch2Avg, phase5Avg);
   #endif
 
 
