@@ -228,6 +228,30 @@ void gen_ser_comp_payload(
   free(comp_buf);
 }
 
+void gpcore_do_extract(uint8_t *inp, uint8_t *outp, int low_val, int high_val, uint8_t *aecs){
+  uint32_t num_inputs = high_val - low_val;
+
+  uint32_t iaa_filter_flags = 28;
+
+  struct iaa_filter_aecs_t iaa_filter_aecs =
+  {
+    .rsvd = 0,
+    .rsvd2 = 0,
+    .rsvd3 = 0,
+    .rsvd4 = 0,
+    .rsvd5 = 0,
+    .rsvd6 = 0
+  };
+
+  /* prepare aecs */
+  memset(aecs, 0, IAA_FILTER_AECS_SIZE);
+  iaa_filter_aecs.low_filter_param = low_val;
+  iaa_filter_aecs.high_filter_param = high_val;
+  memcpy(aecs, (void *)&iaa_filter_aecs, IAA_FILTER_AECS_SIZE);
+
+  iaa_do_extract(outp, inp, (void *)aecs, num_inputs, iaa_filter_flags);
+}
+
 bool gDebugParam = false;
 int *glob_indir_arr = NULL; // TODO
 int num_accesses = 0; // TODO
@@ -252,11 +276,13 @@ int main(int argc, char **argv){
   int p_off = 0;
   char *srcs = NULL;
   char *dsts = NULL;
-  char *dsa_dsts = NULL;
+  char *dsts_2 = NULL;
   int batch_size = 64;
 
   char *tmp_plain_buf = NULL;
   uint64_t src_buf_space;
+
+  uint8_t *aecs = NULL;
 
   get_opts(argc, argv);
 
@@ -293,6 +319,20 @@ int main(int argc, char **argv){
   memset(demote1_array_start, 0, sizeof(uint64_t) * total_requests);
   memset(pref1_array_end, 0, sizeof(uint64_t) * total_requests);
   memset(pref1_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(phase1_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(phase1_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(phase2_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(phase2_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(phase3_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(phase3_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(demote2_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(demote2_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(phase4_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(phase4_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(pref2_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(pref2_array_start, 0, sizeof(uint64_t) * total_requests);
+  memset(phase5_array_end, 0, sizeof(uint64_t) * total_requests);
+  memset(phase5_array_start, 0, sizeof(uint64_t) * total_requests);
 
 
   uint64_t diffs[total_requests];
@@ -335,7 +375,8 @@ int main(int argc, char **argv){
   comp = (idxd_comp *)alloc_numa_offset(nm, sizeof(idxd_comp) * total_requests, 0);
   srcs = (char *)alloc_numa_offset(nm, max_payload_expansion * total_requests, 0);
   dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
-  dsa_dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
+  dsts_2 = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
+  aecs = (uint8_t *)alloc_numa_offset(nm, IAA_FILTER_AECS_SIZE * 2 * total_requests, 0);
 
 
   rc = alloc_numa_mem(nm, pg_size, node);
@@ -345,9 +386,10 @@ int main(int argc, char **argv){
   }
   add_base_addr(nm, (void **)&srcs);
   add_base_addr(nm, (void **)&dsts);
-  add_base_addr(nm, (void **)&dsa_dsts);
+  add_base_addr(nm, (void **)&dsts_2);
   add_base_addr(nm, (void **)&desc);
   add_base_addr(nm, (void **)&comp);
+  add_base_addr(nm, (void **)&aecs);
   memset(comp, 0, sizeof(idxd_comp) * total_requests);
   memset(desc, 0, sizeof(idxd_desc) * total_requests);
   initialize_iaa_wq(iaa_dev_id, iaa_wq_id, wq_type);
@@ -371,12 +413,14 @@ int main(int argc, char **argv){
 
   flush_range((void *)srcs, max_payload_expansion * total_requests);
   flush_range((void *)dsts, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush decrypt dsts */
-  prefault_pages((void *)dsa_dsts, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush source, write prefault dsat dsts */
+  prefault_pages((void *)dsts_2, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush source, write prefault dsat dsts */
 
   for(int i=0; i<total_requests; i++){
-    char *src = (char *)&srcs[i * max_payload_expansion];
-    void **dst = (void **)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
-    void **cpy_dst = (void **)&dsa_dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    uint8_t *src = (uint8_t *)&srcs[i * max_payload_expansion];
+    uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    void **filter_dst = (void **)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+
+    uint8_t *m_aecs = (uint8_t *)&aecs[i * IAA_FILTER_AECS_SIZE * 2];
 
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
@@ -485,19 +529,76 @@ int main(int argc, char **argv){
     #endif
     }
 
-      uint32_t hash;
-      LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
-      #ifdef EXETIME
-      start = rdtsc();
-      #endif
-      #ifdef EXETIME
-      end = rdtsc();
-      #endif
-
+    #ifdef EXETIME
+    start = rdtsc();
+    #endif
+    uint32_t hash;
+    LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
+    #ifdef EXETIME
+    end = rdtsc();
+    #endif
     #ifdef EXETIME
     phase3_array_start[i] = start;
     phase3_array_end[i] = end;
     #endif
+
+    /* Acc Phase 2*/
+    if (sync_demote){
+      #ifdef EXETIME
+      start = rdtsc();
+      #endif
+      demote_buf((char *)dst, decomp_size);
+      #ifdef EXETIME
+      end = rdtsc();
+      demote2_array_start[i] = start;
+      demote2_array_end[i] = end;
+      #endif
+    } else {
+      #ifdef EXETIME
+      demote2_array_start[i] = 0;
+      demote2_array_end[i] = 0;
+      #endif
+    }
+
+    if(!noAcc){
+      prepare_iaa_filter_desc_with_preallocated_comp(
+        m_desc, (uint64_t)dst, (uint64_t)filter_dst, (uint64_t)m_comp, decomp_size);
+      while(enqcmd((void *)((char *)(iaa->wq_reg) + p_off), m_desc)){
+      }
+      #ifdef EXETIME
+      start = rdtsc();
+      #endif
+      while(m_comp->status == 0){
+        /* wait for completion */
+      }
+      #ifdef EXETIME
+      end = rdtsc();
+      #endif
+      if(m_comp->status != IAX_COMP_SUCCESS){
+        LOG_PRINT(LOG_ERR, "Failed to filter: %x\n", m_comp->status);
+        return -1;
+      }
+    } else {
+      #ifdef EXETIME
+      start = rdtsc();
+      #endif
+      gpcore_do_extract(
+        src,
+        dst,
+        0,
+        buf_size / 2,
+        m_aecs
+      );
+      #ifdef EXETIME
+      end = rdtsc();
+      #endif
+    }
+    #ifdef EXETIME
+    phase4_array_start[i] = start;
+    phase4_array_end[i] = end;
+    #endif
+
+
   }
 
   #ifdef EXETIME
@@ -506,13 +607,16 @@ int main(int argc, char **argv){
   uint64_t DemoteAvg;
   uint64_t SwPrftchAvg;
   uint64_t DotProdAvg;
+  uint64_t phase4Avg;
   avg_samples_from_arrays(diffs,phase1Avg, phase1_array_end, phase1_array_start, total_requests);
   avg_samples_from_arrays(diffs,MemcpyAvg, phase2_array_end, phase2_array_start, total_requests);
   avg_samples_from_arrays(diffs,DemoteAvg, demote1_array_end, demote1_array_start, total_requests);
   avg_samples_from_arrays(diffs,SwPrftchAvg, pref1_array_end, pref1_array_start, total_requests);
   avg_samples_from_arrays(diffs,DotProdAvg, phase3_array_end, phase3_array_start, total_requests);
+  avg_samples_from_arrays(diffs,phase4Avg, phase4_array_end, phase4_array_start, total_requests);
 
-  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg );
+
+  PRINT("%lu\n%lu\n%lu\n%lu\n%lu\n%lu\n",phase1Avg, DemoteAvg, MemcpyAvg, SwPrftchAvg, DotProdAvg, phase4Avg);
   #endif
 
 
