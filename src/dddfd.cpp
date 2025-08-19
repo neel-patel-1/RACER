@@ -107,6 +107,62 @@ rdtsc(void)
 	return tsc;
 }
 
+static inline void decrypt_feature(void *cipher_inp, void *plain_out, int input_size){
+  Ipp8u *pKey = (Ipp8u *)"0123456789abcdef";
+  Ipp8u *pIV = (Ipp8u *)"0123456789ab";
+  int keysize = 16;
+  int ivsize = 12;
+  int aadSize = 16;
+  Ipp8u aad[aadSize];
+  IppStatus status;
+
+  status = ippsAES_GCMReset(pState);
+  if(status != ippStsNoErr){
+    LOG_PRINT(LOG_ERR, "Failed to reset AES GCM\n");
+  }
+  status = ippsAES_GCMStart(pIV, ivsize, aad, aadSize, pState);
+  if(status != ippStsNoErr){
+    LOG_PRINT(LOG_ERR, "Failed to start AES GCM\n");
+  }
+  status = ippsAES_GCMDecrypt((Ipp8u *)cipher_inp, (Ipp8u *)plain_out, input_size, pState);
+  if(status != ippStsNoErr){
+    LOG_PRINT(LOG_ERR, "Failed to decrypt AES GCM: %d\n", status);
+  }
+
+  LOG_PRINT(LOG_TOO_VERBOSE, "Decrypted: %x\n", *(uint32_t *)plain_out);
+}
+
+
+static __always_inline void flush_range(void *start, size_t len)
+{
+  char *ptr = (char *)start;
+  char *end = ptr + len;
+
+  for (; ptr < end; ptr += 64) {
+    _mm_clflush(ptr);
+  }
+}
+
+static __always_inline void demote_buf(char *buf, int size){
+  for(int i = 0; i < size; i+=64){
+    _cldemote((void *)&buf[i]);
+  }
+
+}
+
+static __always_inline void write_to_buf(char *buf, int size){
+  for(int i = 0; i < size; i+=64){
+    ((volatile char *)(buf))[i] = 'a';
+  }
+}
+
+static __always_inline void prefault_pages(void *buf, int size){
+  volatile char *ptr = (char *)buf;
+  for(int i = 0; i < size; i+=4096){
+    ptr[i] = 'a'; // Touch each page to ensure it's faulted in
+  }
+}
+
 void gen_ser_buf(int avail_out, char *p_val, char *dst, int *msg_size, int insize){
   router::RouterRequest req;
 
@@ -172,55 +228,6 @@ void gen_ser_comp_payload(
   free(comp_buf);
 }
 
-static inline void decrypt_feature(void *cipher_inp, void *plain_out, int input_size){
-  Ipp8u *pKey = (Ipp8u *)"0123456789abcdef";
-  Ipp8u *pIV = (Ipp8u *)"0123456789ab";
-  int keysize = 16;
-  int ivsize = 12;
-  int aadSize = 16;
-  Ipp8u aad[aadSize];
-  IppStatus status;
-
-  status = ippsAES_GCMReset(pState);
-  if(status != ippStsNoErr){
-    LOG_PRINT(LOG_ERR, "Failed to reset AES GCM\n");
-  }
-  status = ippsAES_GCMStart(pIV, ivsize, aad, aadSize, pState);
-  if(status != ippStsNoErr){
-    LOG_PRINT(LOG_ERR, "Failed to start AES GCM\n");
-  }
-  status = ippsAES_GCMDecrypt((Ipp8u *)cipher_inp, (Ipp8u *)plain_out, input_size, pState);
-  if(status != ippStsNoErr){
-    LOG_PRINT(LOG_ERR, "Failed to decrypt AES GCM: %d\n", status);
-  }
-
-  LOG_PRINT(LOG_TOO_VERBOSE, "Decrypted: %x\n", *(uint32_t *)plain_out);
-}
-
-
-static __always_inline void flush_range(void *start, size_t len)
-{
-  char *ptr = (char *)start;
-  char *end = ptr + len;
-
-  for (; ptr < end; ptr += 64) {
-    _mm_clflush(ptr);
-  }
-}
-
-static __always_inline void demote1_buf(char *buf, int size){
-  for(int i = 0; i < size; i+=64){
-    _cldemote((void *)&buf[i]);
-  }
-
-}
-
-static __always_inline void write_to_buf(char *buf, int size){
-  for(int i = 0; i < size; i+=64){
-    ((volatile char *)(buf))[i] = 'a';
-  }
-}
-
 bool gDebugParam = false;
 int *glob_indir_arr = NULL; // TODO
 int num_accesses = 0; // TODO
@@ -247,8 +254,6 @@ int main(int argc, char **argv){
   char *dsts = NULL;
   char *dsa_dsts = NULL;
   int batch_size = 64;
-  char *emul_dymmy_buf = NULL;
-  char *emul_dymmy_buf_2 = NULL;
 
   char *tmp_plain_buf = NULL;
   uint64_t src_buf_space;
@@ -331,8 +336,6 @@ int main(int argc, char **argv){
   srcs = (char *)alloc_numa_offset(nm, max_payload_expansion * total_requests, 0);
   dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
   dsa_dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
-  emul_dymmy_buf = (char *)alloc_numa_offset(nm, buf_size * total_requests, 0);
-  emul_dymmy_buf_2 = (char *)alloc_numa_offset(nm, buf_size * total_requests, 0);
 
 
   rc = alloc_numa_mem(nm, pg_size, node);
@@ -345,8 +348,6 @@ int main(int argc, char **argv){
   add_base_addr(nm, (void **)&dsa_dsts);
   add_base_addr(nm, (void **)&desc);
   add_base_addr(nm, (void **)&comp);
-  add_base_addr(nm, (void **)&emul_dymmy_buf);
-  add_base_addr(nm, (void **)&emul_dymmy_buf_2);
   memset(comp, 0, sizeof(idxd_comp) * total_requests);
   memset(desc, 0, sizeof(idxd_desc) * total_requests);
   initialize_iaa_wq(iaa_dev_id, iaa_wq_id, wq_type);
@@ -356,16 +357,12 @@ int main(int argc, char **argv){
 
   uint64_t buf_offset = 0;
 
-#ifdef THROUGHPUT
-for(int j=0; j<iter; j++){
-  start = rdtsc();
-#endif
-
   int avail_out;
   gen_ser_comp_payload((char *)srcs, buf_size,
     max_comp_size, max_payload_expansion,
     &avail_out, target_ratio);
   LOG_PRINT(LOG_DEBUG, "ser'd bufsize: %d\n", avail_out);
+
   for(int i=1; i<total_requests; i++){
     memcpy((void *)&srcs[i * max_payload_expansion], (void *)srcs, avail_out);
   }
@@ -374,30 +371,24 @@ for(int j=0; j<iter; j++){
 
   flush_range((void *)srcs, max_payload_expansion * total_requests);
   flush_range((void *)dsts, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush decrypt dsts */
-  for(int i=0; i<IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests; i+=4096){
-    dsa_dsts[i] = 'a';
-  } /* flush source, write prefault dsat dsts */
-  flush_range((void *)emul_dymmy_buf, buf_size * total_requests);
+  prefault_pages((void *)dsa_dsts, IAA_DECOMPRESS_MAX_DEST_SIZE * total_requests); /* flush source, write prefault dsat dsts */
 
   for(int i=0; i<total_requests; i++){
+    char *src = (char *)&srcs[i * max_payload_expansion];
+    void **dst = (void **)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+    void **cpy_dst = (void **)&dsa_dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
+    router::RouterRequest req;
     p_off = (p_off + 64) % 4096;
 
-    void *encry_buf;
-    void *decry_buf;
-
-    void *comp_buf;
-    void *decomp_buf;
-
-    int comp_buf_size = 0;
-
-    encry_buf = (void *)&srcs[i * max_payload_expansion];
     /* Core Phase 1*/
     #ifdef EXETIME
     start = rdtsc();
     #endif
 
+    req.ParseFromArray((void *)src, avail_out);
 
     #ifdef EXETIME
     end = rdtsc();
@@ -414,7 +405,7 @@ for(int j=0; j<iter; j++){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      demote1_buf((char *)decry_buf, decomp_size);
+      demote_buf((char *)&(req.value()[0]), decomp_size);
       #ifdef EXETIME
       end = rdtsc();
       demote1_array_end[i] = end;
@@ -430,8 +421,8 @@ for(int j=0; j<iter; j++){
     if(!noAcc){
       /* offload memcpy to dsa */
       prepare_iaa_decompress_desc_with_preallocated_comp(
-        m_desc, (uint64_t)(comp_buf), (uint64_t)decomp_buf,
-        (uint64_t)(m_comp), comp_buf_size);
+        m_desc, (uint64_t)(&(req.value())[0]), (uint64_t)dst,
+        (uint64_t)(m_comp), req.value().size());
       while(enqcmd((void *)((char *)(iaa->wq_reg) + p_off), m_desc) ){
         /* retry submit */
       }
@@ -476,7 +467,7 @@ for(int j=0; j<iter; j++){
 
     if(sync_prefetch){
       LOG_PRINT(LOG_TOO_VERBOSE, "Sync prefetch real buffers\n");
-      char *fetch_buf = (char *)decomp_buf;
+      char *fetch_buf = (char *)dst;
       #ifdef EXETIME
       start = rdtsc();
       #endif
@@ -491,7 +482,7 @@ for(int j=0; j<iter; j++){
     }
 
       uint32_t hash;
-      LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)decomp_buf);
+      LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
       #ifdef EXETIME
       start = rdtsc();
       #endif
