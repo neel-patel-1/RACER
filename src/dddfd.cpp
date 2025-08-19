@@ -534,7 +534,7 @@ int main(int argc, char **argv){
     #ifdef EXETIME
     start = rdtsc();
     #endif
-    hash = furc_hash((void *)dst, decomp_size, 16);
+    hash = furc_hash((char *)dst, decomp_size, 16);
     #ifdef EXETIME
     end = rdtsc();
     #endif
