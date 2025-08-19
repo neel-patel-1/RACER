@@ -529,11 +529,12 @@ int main(int argc, char **argv){
     #endif
     }
 
+    uint32_t hash;
+    LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
     #ifdef EXETIME
     start = rdtsc();
     #endif
-    uint32_t hash;
-    LOG_PRINT(LOG_DEBUG, "Please fetch: %lx\n", (uintptr_t)dst);
+    hash = furc_hash((void *)dst, decomp_size, 16);
     #ifdef EXETIME
     end = rdtsc();
     #endif
