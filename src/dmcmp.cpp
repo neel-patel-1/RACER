@@ -616,8 +616,8 @@ int main(int argc, char **argv){
     calc_mean(
       (int *)cpy_dst,
       (int *)mean_vec,
-      buf_size,
-      buf_size
+      buf_size / sizeof(int),
+      buf_size / sizeof(int)
     );
 
     #ifdef EXETIME
