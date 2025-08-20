@@ -464,6 +464,10 @@ int main(int argc, char **argv){
       start = rdtsc();
       #endif
       demote_buf((char *)src, buf_size);
+      for (int i=0; i<buf_size; i+=64) {
+        _mm_prefetch((void *)&cpy_dst[i], _MM_HINT_T1);
+      }
+      demote_buf((char *)cpy_dst, buf_size);
       #ifdef EXETIME
       end = rdtsc();
       demote1_array_end[i] = end;
@@ -548,7 +552,7 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      demote_buf((char *)dst, decomp_size);
+      demote_buf((char *)cpy_dst, buf_size);
       #ifdef EXETIME
       end = rdtsc();
       demote2_array_start[i] = start;
@@ -604,7 +608,7 @@ int main(int argc, char **argv){
       #ifdef EXETIME
       start = rdtsc();
       #endif
-      for(int j=0; j<decomp_size; j+=64){
+      for(int j=0; j<buf_size; j+=64){
         _mm_prefetch((void *)(fetch_buf + j), _MM_HINT_T1);
       }
       #ifdef EXETIME
@@ -625,7 +629,7 @@ int main(int argc, char **argv){
     //   buf_size / sizeof(int),
     //   buf_size / sizeof(int)
     // );
-    calc_hist(cpy_dst, (void *)hist, buf_size/64, &sz);
+    calc_hist(cpy_dst, (void *)hist, buf_size/2, &sz);
 
     #ifdef EXETIME
     end = rdtsc();
