@@ -284,6 +284,9 @@ int main(int argc, char **argv){
   char *tmp_plain_buf = NULL;
   uint64_t src_buf_space;
 
+  int *hists = NULL;
+  int hist_size = 256 * 3;
+
   uint8_t *aecs = NULL;
 
   get_opts(argc, argv);
@@ -378,6 +381,7 @@ int main(int argc, char **argv){
   comp = (idxd_comp *)alloc_numa_offset(nm, sizeof(idxd_comp) * total_requests, 0);
   srcs = (char *)alloc_numa_offset(nm, max_payload_expansion * total_requests, 0);
   dsts = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
+  hists = (int *)alloc_numa_offset(nm, sizeof(int) * hist_size * total_requests, 0);
   dsts_2 = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0);
   aecs = (uint8_t *)alloc_numa_offset(nm, IAA_FILTER_AECS_SIZE * 2 * total_requests, 0);
   mean_vector = (int *)alloc_numa_offset(nm, sizeof(int) * total_requests * buf_size, 0);
@@ -390,6 +394,7 @@ int main(int argc, char **argv){
   }
   add_base_addr(nm, (void **)&srcs);
   add_base_addr(nm, (void **)&dsts);
+  add_base_addr(nm, (void **)&hists);
   add_base_addr(nm, (void **)&dsts_2);
   add_base_addr(nm, (void **)&desc);
   add_base_addr(nm, (void **)&comp);
@@ -417,6 +422,7 @@ int main(int argc, char **argv){
     uint8_t *dst = (uint8_t *)&dsts[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     void **cpy_dst = (void **)&dsts_2[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
     int *mean_vec = (int *)&mean_vector[i * buf_size];
+    int *hist = (int *)&hists[i * hist_size];
 
     idxd_comp *m_comp = &comp[i];
     idxd_desc *m_desc = &desc[i];
@@ -613,12 +619,13 @@ int main(int argc, char **argv){
     #ifdef EXETIME
     start = rdtsc();
     #endif
-    calc_mean(
-      (int *)cpy_dst,
-      (int *)mean_vec,
-      buf_size / sizeof(int),
-      buf_size / sizeof(int)
-    );
+    // calc_mean(
+    //   (int *)cpy_dst,
+    //   (int *)mean_vec,
+    //   buf_size / sizeof(int),
+    //   buf_size / sizeof(int)
+    // );
+    calc_hist(cpy_dst, (void *)hist, buf_size/64, &sz);
 
     #ifdef EXETIME
     end = rdtsc();
