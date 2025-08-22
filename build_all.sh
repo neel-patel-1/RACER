@@ -10,7 +10,8 @@ echo y | sudo apt install make
 echo y | sudo apt install g++
 echo y | sudo apt install git
 echo y | sudo apt install libboost-all-dev
-
+echo y | sudo apt install libssl-dev
+echo y | sudo apt install protobuf-compiler
 
 # idxd-config
 ROOT=$(pwd)
