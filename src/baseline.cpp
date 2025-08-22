@@ -47,7 +47,11 @@ constexpr uint64_t buf_llc_size = 78643200;
 constexpr uint64_t buf_1gb_size = 1073741824;
 constexpr uint64_t buf_4gb_size = 4294967296;
 
+#ifdef __AVX512F__
 #define VECTOR_LOAD(x) _mm512_load_pd((void *)x);
+#else
+#define VECTOR_LOAD(x) _mm256_load_pd((double *)x);
+#endif
 
 #define READ_ONCE(x) \
   (*reinterpret_cast<volatile std::remove_reference_t<decltype(x)>*>(&(x)))
@@ -392,14 +396,22 @@ static inline void decrypt_feature(void *cipher_inp, void *plain_out, int input_
 
 void sequential_writer_uninterruptible(char *l2_buf, uint64_t l2_buf_size){
   int l2_buf_idx = 0;
+  #ifdef __AVX512F__
   volatile __m512d v;
+  #else
+  volatile __m256d v;
+  #endif
   if(l2_buf_size % 64 != 0){
     LOG_PRINT(LOG_ERR, "Buffer size not multiple of 64\n");
     return;
   }
   while(l2_buf_idx < l2_buf_size){
     v = VECTOR_LOAD( (l2_buf + l2_buf_idx) );
+    #ifdef __AVX512F__
     l2_buf_idx += 64;
+    #else
+    l2_buf_idx += 32;
+    #endif
   }
 
   LOG_PRINT(LOG_DEBUG, "SeqWriterCompleted\n");

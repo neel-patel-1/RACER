@@ -28,7 +28,7 @@ obj/context_fast.o: src/context_fast.S
 	$(CXX)  -c -o $@ $^  -I./include
 
 obj/kernels/%.a: src/kernels/%.cpp
-	$(CXX) -std=c++17 -mavx512f -march=native -O3 -fPIC -c $< -o $@ -I$(ROOT_DIR)/include
+	$(CXX) -std=c++17 -march=native -O3 -fPIC -c $< -o $@ -I$(ROOT_DIR)/include
 
 obj/%.o: src/%.cpp
 	$(CXX) -std=c++17 -O3 -fPIC -c $< -o $@ $(INCLUDES) -fpermissive

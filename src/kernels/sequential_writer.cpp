@@ -3,11 +3,19 @@
 #include <immintrin.h>
 #include <cstdint>
 
+#ifdef __AVX512F__
 #define VECTOR_LOAD(x) _mm512_load_pd((void *)x);
+#else
+#define VECTOR_LOAD(x) _mm256_load_pd((double *)x);
+#endif
 
 void sequential_writer(char *l2_buf, uint64_t l2_buf_size){
   int l2_buf_idx = 0;
+  #ifdef __AVX512F__
   volatile __m512d v;
+  #else
+  volatile __m256d v;
+  #endif
   LOG_PRINT(LOG_DEBUG, "Filler buf size: %ld\n", l2_buf_size);
   if(l2_buf_size % 64 != 0){
     LOG_PRINT(LOG_ERR, "Buffer size not multiple of 64\n");
@@ -15,7 +23,11 @@ void sequential_writer(char *l2_buf, uint64_t l2_buf_size){
   }
   while(l2_buf_idx < l2_buf_size){
     v = VECTOR_LOAD( (l2_buf + l2_buf_idx) );
+    #ifdef __AVX512F__
     l2_buf_idx += 64;
+    #else
+    l2_buf_idx += 32;
+    #endif
   }
 
   LOG_PRINT(LOG_DEBUG, "SeqWriterCompleted\n");
