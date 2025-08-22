@@ -5,7 +5,7 @@
 PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 )
 
 # print header with sizes in KB (human-friendly)
-printf "\t"
+printf "PE\tPlacement\t"
 for s in "${PAYLOAD_SIZES[@]}"; do
   # divide by 1024 and print without unnecessary zeros
   printf "\t%s" "$(awk -v v="$s" 'BEGIN{ f=v/1024; if (f==int(f)) printf("%d",f); else printf("%g",f)}')"
@@ -53,7 +53,7 @@ for app_idx in ${!APPS[@]}; do
   name=${NAMES[$app_idx]}
   app=${APPS[$app_idx]}
   opcode=${OPCODES[$app_idx]}
-  printf "${name}-${app}\tL2D"
+  printf "${name}-${app}\t"
   read -r row0 row1 row2 row3 < <(collect_rows "placement_${name}_${opcode}" "Block")
   # collect_rows already printed rows; but we need them returned — change to capture:
   # workaround: re-call but capture output properly
