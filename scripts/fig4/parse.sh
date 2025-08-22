@@ -44,22 +44,25 @@ collect_rows() {
 }
 
 # print DSA block results (Block entries from placement_dsa_3_ -> memcpy)
-printf "DSA\tL2D"
-read -r row0 row1 row2 row3 < <(collect_rows "placement_dsa_3" "Block")
-# collect_rows already printed rows; but we need them returned — change to capture:
-# workaround: re-call but capture output properly
-dsa_rows=$(collect_rows "placement_dsa_3" "Block")
-# print with labels
-awk -v r="$dsa_rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
+NAMES=( "dsa" "dsa" "iaa" )
+APPS=( 8 8 9 )
+OPCODES=( 3 4 66 )
+PLACEMENTS=( 0 1 2 3 )
 
-# print gpCore (Baseline entries from same memcpy logs)
-gp_rows=$(collect_rows "placement_dsa_3" "Baseline")
-printf "gpCore\tL2D"
-awk -v r="$gp_rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
+for app_idx in ${!APPS[@]}; do
+  name=${NAMES[$app_idx]}
+  app=${APPS[$app_idx]}
+  opcode=${OPCODES[$app_idx]}
+  printf "${name}-${app}\tL2D"
+  read -r row0 row1 row2 row3 < <(collect_rows "placement_${name}_${opcode}" "Block")
+  # collect_rows already printed rows; but we need them returned — change to capture:
+  # workaround: re-call but capture output properly
+  rows=$(collect_rows "placement_${name}_${opcode}" "Block")
+  # print with labels
+  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
 
-# Note:
-# - The script uses the same patterns as the original parse.sh:
-#   * placement_dsa_3_${j}_cstate_* for memcpy (Block=DSA, Baseline=gpCore)
-#   * If you want memfill or decompress groups, call collect_rows with placement_dsa_4 or placement_iaa_66 and print similarly.
-# - collect_rows assumes each pattern iteration yields four cache-state files in consistent order (L2D L2C LLC DRAM).
-# ...existing code...
+  # print gpCore (Baseline entries from same logs)
+  printf "gpCore\tL2D"
+  rows=$(collect_rows "placement_${name}_${opcode}" "Baseline")
+  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
+done
