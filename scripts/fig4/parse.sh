@@ -53,7 +53,7 @@ for app_idx in ${!APPS[@]}; do
   name=${NAMES[$app_idx]}
   app=${APPS[$app_idx]}
   opcode=${OPCODES[$app_idx]}
-  printf "${name}-${app}\t"
+  printf "${name}-${opcode}\t"
   read -r row0 row1 row2 row3 < <(collect_rows "placement_${name}_${opcode}" "Block")
   # collect_rows already printed rows; but we need them returned — change to capture:
   # workaround: re-call but capture output properly
@@ -62,7 +62,7 @@ for app_idx in ${!APPS[@]}; do
   awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
 
   # print gpCore (Baseline entries from same logs)
-  printf "gpCore\tL2D"
+  printf "gpCore\t"
   rows=$(collect_rows "placement_${name}_${opcode}" "Baseline")
   awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
 done
