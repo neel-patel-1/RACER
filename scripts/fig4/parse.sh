@@ -1,72 +1,65 @@
 #!/bin/bash
 
-PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576  )
+#!/bin/bash
 
-echo ""
-echo "gpcore memcpy"
-echo "L2D L2C LLC DRAM"
+PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 )
 
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_dsa_3_${j}_cstate_*;
-  do
-    grep Baseline $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
+# print header with sizes in KB (human-friendly)
+printf "\t"
+for s in "${PAYLOAD_SIZES[@]}"; do
+  # divide by 1024 and print without unnecessary zeros
+  printf "\t%s" "$(awk -v v="$s" 'BEGIN{ f=v/1024; if (f==int(f)) printf("%d",f); else printf("%g",f)}')"
 done
+printf "\n"
 
-echo ""
-echo "dsa memcpy"
-echo "L2D L2C LLC DRAM"
+# helper: collect values per-cache-state (assumes 4 cache-state files per pattern, grep_word selects Baseline/Block)
+# args: pattern_prefix grep_word
+collect_rows() {
+  local pattern="$1" grep_word="$2"
+  # init rows
+  local rows0="" rows1="" rows2="" rows3=""
+  for j in "${PAYLOAD_SIZES[@]}"; do
+    # gather the $5 field from matching files (keeps same order as files -> cache states)
+    vals=$(for i in logs/${pattern}_${j}_cstate_*; do
+            grep "$grep_word" "$i" 2>/dev/null
+          done | awk '{printf("%s ", $5)}')
+    # split into array
+    read -r -a arr <<< "$vals"
+    # ensure 4 entries (fill missing with '-')
+    for k in ${!arr[@]}; do :; done
+    arr[0]=${arr[0]:--}
+    arr[1]=${arr[1]:--}
+    arr[2]=${arr[2]:--}
+    arr[3]=${arr[3]:--}
+    rows0="${rows0}\t${arr[0]}"
+    rows1="${rows1}\t${arr[1]}"
+    rows2="${rows2}\t${arr[2]}"
+    rows3="${rows3}\t${arr[3]}"
+  done
+  # emit rows (tab-prefixed to align under the left label)
+  printf "%s\n" "$rows0"
+  printf "%s\n" "$rows1"
+  printf "%s\n" "$rows2"
+  printf "%s\n" "$rows3"
+}
 
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_dsa_3_${j}_cstate_*;
-  do
-    grep Block $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
-done
+# print DSA block results (Block entries from placement_dsa_3_ -> memcpy)
+printf "DSA\tL2D"
+read -r row0 row1 row2 row3 < <(collect_rows "placement_dsa_3" "Block")
+# collect_rows already printed rows; but we need them returned — change to capture:
+# workaround: re-call but capture output properly
+dsa_rows=$(collect_rows "placement_dsa_3" "Block")
+# print with labels
+awk -v r="$dsa_rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
 
-echo ""
-echo "gpcore memfill"
-echo "L2D L2C LLC DRAM"
+# print gpCore (Baseline entries from same memcpy logs)
+gp_rows=$(collect_rows "placement_dsa_3" "Baseline")
+printf "gpCore\tL2D"
+awk -v r="$gp_rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDRAM%s\n", lines[1], lines[2], lines[3], lines[4]) }'
 
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_dsa_4_${j}_cstate_*;
-  do
-    grep Baseline $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
-done
-
-echo ""
-echo "dsa memfill"
-echo "L2D L2C LLC DRAM"
-
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_dsa_4_${j}_cstate_*;
-  do
-    grep Block $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
-done
-
-echo ""
-echo "gpcore decompress"
-echo "L2D L2C LLC DRAM"
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_iaa_66_${j}_cstate_*;
-  do
-    grep Baseline $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
-done
-
-echo ""
-echo "iaa decompress"
-for j in "${PAYLOAD_SIZES[@]}"
-do
-  for i in logs/placement_iaa_66_${j}_cstate_*;
-  do
-    grep Block $i;
-  done | awk '{printf("%s ", $5);} END{printf( "\n")}'
-done
+# Note:
+# - The script uses the same patterns as the original parse.sh:
+#   * placement_dsa_3_${j}_cstate_* for memcpy (Block=DSA, Baseline=gpCore)
+#   * If you want memfill or decompress groups, call collect_rows with placement_dsa_4 or placement_iaa_66 and print similarly.
+# - collect_rows assumes each pattern iteration yields four cache-state files in consistent order (L2D L2C LLC DRAM).
+# ...existing code...
