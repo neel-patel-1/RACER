@@ -47,7 +47,7 @@ collect_rows() {
 NAMES=( "dsa" "dsa" "iaa" )
 APPS=( 8 8 9 )
 OPCODES=( 3 4 66 )
-PLACEMENTS=( 0 1 2 3 )
+PLACEMENTS=( 0 1 2 3 4 )
 
 for app_idx in ${!APPS[@]}; do
   name=${NAMES[$app_idx]}

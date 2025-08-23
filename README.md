@@ -15,6 +15,8 @@ sudo python3 scripts/accel_conf.py --load=scripts/confs/idxd-2n8d64e8w128s-s-n1-
 * Add hugepages
 ```sh
 echo 10 | sudo tee /sys/devices/system/node/node0/hugepages/hugepages-1048576kB/nr_hugepages
+### on every node -- e.g., node 2 if doing CXL tests
+echo 10 | sudo tee /sys/devices/system/node/node2/hugepages/hugepages-1048576kB/nr_hugepages
 ```
 
 `scripts/fig*` directories reproduce the figures from [RACER: Avoiding End-to-End Slowdowns in Accelerated Chip Multi-Processors]()

@@ -1643,7 +1643,7 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1659,6 +1659,8 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
     case LLC:
       break;
     case DRAM:
+      break;
+    case CXL_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1754,7 +1756,7 @@ void dsa_offload(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1770,6 +1772,8 @@ void dsa_offload(fcontext_transfer_t arg){
     case LLC:
       break;
     case DRAM:
+      break;
+    case CXL_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1891,6 +1895,7 @@ void baseline_gpcore_decompress(fcontext_transfer_t arg){
       demote_buf((char *)src, xfer_size);
       break;
     case DRAM:
+    case CXL_DRAM:
       flush_range(src, xfer_size);
       break;
     default:
@@ -1985,6 +1990,7 @@ void iaa_offload(fcontext_transfer_t arg){
       demote_buf((char *)src, xfer_size);
       break;
     case DRAM:
+    case CXL_DRAM:
       flush_range(src, xfer_size);
       break;
     default:
