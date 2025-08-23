@@ -2888,6 +2888,7 @@ int main(int argc, char **argv){
   char *dst_bufs = NULL;
   int dsa_buf_node = 0;
   int cxl_dram_node = 2; /* hardcoded for urbana */
+  struct numa_mem *dsa_buf_nm = NULL;
   enum cache_state c_state = L2_DIRTY;
   enum dsa_opcode dsa_opcode = DSA_OPCODE_MEMMOVE;
 
@@ -3056,15 +3057,26 @@ int main(int argc, char **argv){
   cpyd_dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
 
   dsa_args = (dsa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dsa_args_t), 0);
+
   if (c_state == CXL_DRAM){
     dsa_buf_node = cxl_dram_node;
   }
-  src_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, dsa_buf_node);
-  dst_bufs = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, dsa_buf_node); /* just provision for max offload size */
+  dsa_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(nm[0]));
+
+  src_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * payload_size, 0);
+  dst_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
 
   iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
-  iaa_src_bufs = (char *)alloc_numa_offset(nm, total_requests * max_comp_size, 0);
-  iaa_dst_bufs = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+
+  iaa_src_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * max_comp_size, 0);
+  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+
+  rc = alloc_numa_mem(dsa_buf_nm, pg_size, dsa_buf_node);
+  if (rc){
+    PRINT("Failed to allocate DSA buffers\n");
+    return -1;
+  }
+
 
   matrix_len = floor(sqrt(payload_size/sizeof(int)));
   mat_size_bytes = matrix_len * matrix_len * sizeof(int);
