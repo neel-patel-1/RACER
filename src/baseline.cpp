@@ -168,6 +168,7 @@ enum cache_state {
   L2_CLEAN,
   LLC,
   DRAM,
+  CXL_DRAM,
   L2_DIRTY_DEMOTE,
   L2_CLEAN_DEMOTE,
   LLC_DEMOTE,
@@ -2885,6 +2886,8 @@ int main(int argc, char **argv){
   dsa_args_t *dsa_args = NULL;
   char *src_bufs = NULL;
   char *dst_bufs = NULL;
+  int dsa_buf_node = 0;
+  int cxl_dram_node = 2; /* hardcoded for urbana */
   enum cache_state c_state = L2_DIRTY;
   enum dsa_opcode dsa_opcode = DSA_OPCODE_MEMMOVE;
 
@@ -3053,8 +3056,11 @@ int main(int argc, char **argv){
   cpyd_dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
 
   dsa_args = (dsa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dsa_args_t), 0);
-  src_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
-  dst_bufs = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+  if (c_state == CXL_DRAM){
+    dsa_buf_node = cxl_dram_node;
+  }
+  src_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, dsa_buf_node);
+  dst_bufs = (char *)alloc_numa_offset(nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, dsa_buf_node); /* just provision for max offload size */
 
   iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
   iaa_src_bufs = (char *)alloc_numa_offset(nm, total_requests * max_comp_size, 0);
