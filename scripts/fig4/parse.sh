@@ -56,13 +56,13 @@ for app_idx in ${!APPS[@]}; do
   name=${NAMES[$app_idx]}
   app=${APPS[$app_idx]}
   opcode=${OPCODES[$app_idx]}
-  printf "${name}-${opcode}\t"
+  printf "${name}-${opcode}"
   rows=$(collect_rows "placement_${name}_${opcode}" "Block")
   # print with labels
   awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\n", lines[1], lines[2], lines[3], lines[4], lines[5]) }'
 
   # print gpCore (Baseline entries from same logs)
-  printf "gpCore\t"
+  printf "gpCore"
   rows=$(collect_rows "placement_${name}_${opcode}" "Baseline")
   awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\n", lines[1], lines[2], lines[3], lines[4], lines[5]) }'
 done
