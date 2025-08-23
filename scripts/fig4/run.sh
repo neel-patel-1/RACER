@@ -6,7 +6,7 @@ bin=exe_time
 make $bin -j
 
 PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 )
-PLACEMENTS=( 4 )
+PLACEMENTS=( 0 1 2 3 4 )
 
 dsa_app=8
 DSA_MEMMOVE=3

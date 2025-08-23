@@ -3067,7 +3067,7 @@ int main(int argc, char **argv){
   if (c_state == CXL_DRAM){
     dsa_buf_node = cxl_dram_node;
   }
-  dsa_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(nm[0]));
+  dsa_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
 
   src_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * payload_size, 0);
   dst_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
@@ -3166,13 +3166,13 @@ int main(int argc, char **argv){
   add_base_addr(nm, (void **)&dec_bufs);
   add_base_addr(nm, (void **)&cpyd_dec_bufs);
 
-  add_base_addr(nm, (void **)&src_bufs);
-  add_base_addr(nm, (void **)&dst_bufs);
+  add_base_addr(dsa_buf_nm, (void **)&src_bufs);
+  add_base_addr(dsa_buf_nm, (void **)&dst_bufs);
   add_base_addr(nm, (void **)&dsa_args);
 
   add_base_addr(nm, (void **)&iaa_args);
-  add_base_addr(nm, (void **)&iaa_src_bufs);
-  add_base_addr(nm, (void **)&iaa_dst_bufs);
+  add_base_addr(dsa_buf_nm, (void **)&iaa_src_bufs);
+  add_base_addr(dsa_buf_nm, (void **)&iaa_dst_bufs);
 
   add_base_addr(nm, (void **)&mmpc_args);
   add_base_addr(nm, (void **)&mm_data);
