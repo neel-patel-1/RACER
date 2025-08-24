@@ -5,7 +5,7 @@
 bin=exe_time
 make $bin -j
 
-PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 )
+PAYLOAD_SIZES=( $(( 2 * 1024 * 1024 )) $(( 4 * 1024 * 1024 )) )
 PLACEMENTS=( 3 4 5 6 )
 
 dsa_app=8

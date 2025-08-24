@@ -2,10 +2,10 @@
 
 #!/bin/bash
 
-PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 )
+PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 $(( 2 * 1024 * 1024 )) $(( 4 * 1024 * 1024 )) )
 
 # print header with sizes in KB (human-friendly)
-printf "PE\tPlacement\t"
+printf "PE\tPlacement"
 for s in "${PAYLOAD_SIZES[@]}"; do
   # divide by 1024 and print without unnecessary zeros
   printf "\t%s" "$(awk -v v="$s" 'BEGIN{ f=v/1024; if (f==int(f)) printf("%d",f); else printf("%g",f)}')"
