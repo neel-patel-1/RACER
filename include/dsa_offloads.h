@@ -20,9 +20,17 @@ void free_dsa_wq();
 void prepare_dsa_memcpy_desc_with_preallocated_comp(
   struct hw_desc *hw, uint64_t src,
   uint64_t dst, uint64_t comp, uint64_t xfer_size);
+void prepare_dsa_memcpy_desc_with_preallocated_comp(
+  struct hw_desc *hw, uint64_t src,
+  uint64_t dst, bool cache_control_en,
+  uint64_t comp, uint64_t xfer_size);
 void prepare_dsa_memfill_desc_with_preallocated_comp(
   struct hw_desc *hw, uint64_t src,
   uint64_t dst, uint64_t comp, uint64_t xfer_size);
+void prepare_dsa_memfill_desc_with_preallocated_comp(
+  struct hw_desc *hw, uint64_t src,
+  uint64_t dst, bool cache_control_en,
+  uint64_t comp, uint64_t xfer_size);
 
 
 #endif

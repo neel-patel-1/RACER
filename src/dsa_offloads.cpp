@@ -18,9 +18,45 @@ void prepare_dsa_memcpy_desc_with_preallocated_comp(
 
 }
 
+void prepare_dsa_memcpy_desc_with_preallocated_comp(
+  struct hw_desc *hw, uint64_t src,
+  uint64_t dst, bool cache_control_en,
+  uint64_t comp, uint64_t xfer_size){
+
+  memset(hw, 0, sizeof(struct hw_desc));
+  hw->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF ;
+  if (cache_control_en)
+    hw->flags |= IDXD_OP_FLAG_CC;
+  hw->src_addr = src;
+  hw->dst_addr = dst;
+  hw->xfer_size = xfer_size;
+  hw->opcode = DSA_OPCODE_MEMMOVE;
+
+  memset((void *)comp, 0, sizeof(ax_comp));
+  hw->completion_addr = comp;
+
+}
+
 void prepare_dsa_memfill_desc_with_preallocated_comp(
   struct hw_desc *hw, uint64_t pattern,
   uint64_t dst, uint64_t comp, uint64_t xfer_size){
+
+  memset(hw, 0, sizeof(struct hw_desc));
+  hw->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
+  hw->src_addr = 0xdeadbeef;
+  hw->dst_addr = dst;
+  hw->xfer_size = xfer_size;
+  hw->opcode = DSA_OPCODE_MEMFILL;
+
+  memset((void *)comp, 0, sizeof(ax_comp));
+  hw->completion_addr = comp;
+
+}
+
+void prepare_dsa_memfill_desc_with_preallocated_comp(
+  struct hw_desc *hw, uint64_t pattern,
+  uint64_t dst, bool cache_control_en,
+  uint64_t comp, uint64_t xfer_size){
 
   memset(hw, 0, sizeof(struct hw_desc));
   hw->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_BOF;
