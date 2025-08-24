@@ -1723,6 +1723,62 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
   fcontext_swap(arg.prev_context, NULL);
 }
 
+static __always_inline void prep_buf_in_memory_hierarchy(void *buf, uint64_t size, enum cache_state c_state){
+  switch (c_state){
+    case L2_DIRTY:
+      write_to_buf((char *)buf, size);
+      break;
+    case L2_CLEAN:
+      break;
+    case LLC:
+      stream_into_cache(buf, size);
+      demote_buf((char *)buf, size);
+      break;
+    case DRAM:
+    case CXL_DRAM:
+    case CXL_AND_DDR_DRAM:
+    case DDR_AND_CXL_DRAM:
+      flush_range(buf, size);
+      break;
+    case L2_DIRTY_DEMOTE:
+      write_to_buf((char *)buf, size);
+      demote_buf((char *)buf, size);
+      break;
+    case L2_CLEAN_DEMOTE:
+      stream_into_cache(buf, size);
+      demote_buf((char *)buf, size);
+      break;
+    case LLC_DEMOTE:
+      stream_into_cache(buf, size);
+      demote_buf((char *)buf, size);
+      break;
+    case DRAM_DEMOTE:
+      flush_range(buf, size);
+      demote_buf((char *)buf, size);
+      break;
+    case CORE_NT:
+      flush_range(buf, size);
+      {
+      int c = 0x41;
+      __m128i i = _mm_set_epi8(c, c, c, c,
+                              c, c, c, c,
+                              c, c, c, c,
+                              c, c, c, c);
+      char *p = (char *)buf;
+      for(int j=0; j<size; j+=64){
+        _mm_stream_si128((__m128i *)&p[j + 0], i);
+        _mm_stream_si128((__m128i *)&p[j + 16], i);
+        _mm_stream_si128((__m128i *)&p[j + 32], i);
+        _mm_stream_si128((__m128i *)&p[j + 48], i);
+      }
+      }
+      break;
+    default:
+      LOG_PRINT(LOG_ERR, "Invalid cache state\n");
+      return;
+  }
+}
+
 void dsa_offload(fcontext_transfer_t arg){
   dsa_args_t *args =
     (dsa_args_t *)arg.data;
@@ -1737,74 +1793,13 @@ void dsa_offload(fcontext_transfer_t arg){
   enum cache_state c_state = args->c_state;
   bool cc_en = true;
 
-  if(c_state != CORE_NT){
-    stream_into_cache(src, xfer_size);
-  } else {
-    flush_range(src, xfer_size);
-  }
-
-  if(c_state == L2_DIRTY){
-    write_to_buf((char *)src, xfer_size);
-  }
-  if(c_state == CORE_NT){
-    int c = 0x41;
-    __m128i i = _mm_set_epi8(c, c, c, c,
-                            c, c, c, c,
-                            c, c, c, c,
-                            c, c, c, c);
-    char *p = (char *)src;
-    for(int j=0; j<xfer_size; j+=64){
-      _mm_stream_si128((__m128i *)&p[j + 0], i);
-      _mm_stream_si128((__m128i *)&p[j + 16], i);
-      _mm_stream_si128((__m128i *)&p[j + 32], i);
-      _mm_stream_si128((__m128i *)&p[j + 48], i);
-    }
-  }
-  if(c_state == LLC || c_state == LLC_DEMOTE){
-    demote_buf((char *)src, xfer_size);
-  }
-  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM || c_state == DDR_AND_CXL_DRAM){
-    cc_en = false;
-    flush_range(src, xfer_size);
-  }
+  /* always flush the destination, prep function will perform placement later */
+  flush_range(dst, xfer_size);
 
 #ifdef EXETIME
   ts0 = rdtsc();
 #endif
 
-  switch(c_state){
-    case L2_DIRTY:
-      break;
-    case L2_CLEAN:
-      break;
-    case LLC:
-      break;
-    case DRAM:
-      break;
-    case CXL_DRAM:
-      break;
-    case CXL_AND_DDR_DRAM:
-      break;
-    case DDR_AND_CXL_DRAM:
-      break;
-    case L2_DIRTY_DEMOTE:
-      demote_buf((char *)src, xfer_size);
-      break;
-    case L2_CLEAN_DEMOTE:
-      demote_buf((char *)src, xfer_size);
-      break;
-    case LLC_DEMOTE:
-      demote_buf((char *)src, xfer_size);
-      break;
-    case DRAM_DEMOTE:
-      demote_buf((char *)src, xfer_size);
-      break;
-    case CORE_NT:
-      break;
-    default:
-      LOG_PRINT(LOG_ERR, "Invalid cache state\n");
-      return;
-  }
 
 #ifdef EXETIME
   ts1 = rdtsc();
@@ -1812,13 +1807,15 @@ void dsa_offload(fcontext_transfer_t arg){
 
   switch(args->opcode){
     case DSA_OPCODE_MEMMOVE:
+      prep_buf_in_memory_hierarchy(src, xfer_size, c_state);
       prepare_dsa_memcpy_desc_with_preallocated_comp(
         desc, (uint64_t)src, (uint64_t)dst, cc_en,
         (uint64_t)comp, xfer_size);
       break;
     case DSA_OPCODE_MEMFILL:
+      prep_buf_in_memory_hierarchy(dst, xfer_size, c_state);
       prepare_dsa_memfill_desc_with_preallocated_comp(
-        desc, 0xdeadbeef, (uint64_t)src, cc_en,
+        desc, 0xdeadbeef, (uint64_t)dst, cc_en,
         (uint64_t)comp, xfer_size);
       break;
     default:
