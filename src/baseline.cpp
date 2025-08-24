@@ -170,6 +170,7 @@ enum cache_state {
   DRAM,
   CXL_DRAM,
   CXL_AND_DDR_DRAM,
+  DDR_AND_CXL_DRAM,
   L2_DIRTY_DEMOTE,
   L2_CLEAN_DEMOTE,
   LLC_DEMOTE,
@@ -1644,7 +1645,7 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM || c_state == DDR_AND_CXL_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1664,6 +1665,8 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
     case CXL_DRAM:
       break;
     case CXL_AND_DDR_DRAM:
+      break;
+    case DDR_AND_CXL_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1759,7 +1762,7 @@ void dsa_offload(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM || c_state == DDR_AND_CXL_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1779,6 +1782,8 @@ void dsa_offload(fcontext_transfer_t arg){
     case CXL_DRAM:
       break;
     case CXL_AND_DDR_DRAM:
+      break;
+    case DDR_AND_CXL_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1904,6 +1909,9 @@ void baseline_gpcore_decompress(fcontext_transfer_t arg){
     case CXL_AND_DDR_DRAM:
       flush_range(src, xfer_size);
       break;
+    case DDR_AND_CXL_DRAM:
+      flush_range(src, xfer_size);
+      break;
     default:
       LOG_PRINT(LOG_ERR, "Invalid cache state\n");
       return;
@@ -1998,6 +2006,9 @@ void iaa_offload(fcontext_transfer_t arg){
     case DRAM:
     case CXL_DRAM:
     case CXL_AND_DDR_DRAM:
+      flush_range(src, xfer_size);
+      break;
+    case DDR_AND_CXL_DRAM:
       flush_range(src, xfer_size);
       break;
     default:
@@ -3078,6 +3089,8 @@ int main(int argc, char **argv){
     dsa_dst_buf_node = cxl_dram_node;
   } else if (c_state == CXL_AND_DDR_DRAM) {
     dsa_src_buf_node = cxl_dram_node;
+  } else if (c_state == DDR_AND_CXL_DRAM) {
+    dsa_dst_buf_node = cxl_dram_node;
   }
   dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
   dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));

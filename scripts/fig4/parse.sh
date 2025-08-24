@@ -17,7 +17,7 @@ printf "\n"
 collect_rows() {
   local pattern="$1" grep_word="$2"
   # init rows
-  local rows0="" rows1="" rows2="" rows3="" rows4="" rows5=""
+  local rows0="" rows1="" rows2="" rows3="" rows4="" rows5="" rows6=""
   for j in "${PAYLOAD_SIZES[@]}"; do
     # gather the $5 field from matching files (keeps same order as files -> cache states)
     vals=$(for i in logs/${pattern}_${j}_cstate_*; do
@@ -32,12 +32,15 @@ collect_rows() {
     arr[2]=${arr[2]:--}
     arr[3]=${arr[3]:--}
     arr[4]=${arr[4]:--}
+    arr[5]=${arr[5]:--}
+    arr[6]=${arr[6]:--}
     rows0="${rows0}\t${arr[0]}"
     rows1="${rows1}\t${arr[1]}"
     rows2="${rows2}\t${arr[2]}"
     rows3="${rows3}\t${arr[3]}"
     rows4="${rows4}\t${arr[4]}"
     rows5="${rows5}\t${arr[5]}"
+    rows6="${rows6}\t${arr[6]}"
   done
   # emit rows (tab-prefixed to align under the left label)
   printf "%s\n" "$rows0"
@@ -46,13 +49,14 @@ collect_rows() {
   printf "%s\n" "$rows3"
   printf "%s\n" "$rows4"
   printf "%s\n" "$rows5"
+  printf "%s\n" "$rows6"
 }
 
 # print DSA block results (Block entries from placement_dsa_3_ -> memcpy)
 NAMES=( "dsa" "dsa" "iaa" )
 APPS=( 8 8 9 )
 OPCODES=( 3 4 66 )
-PLACEMENTS=( 0 1 2 3 4 5 )
+PLACEMENTS=( 0 1 2 3 4 5 6 )
 
 for app_idx in ${!APPS[@]}; do
   name=${NAMES[$app_idx]}
@@ -61,10 +65,10 @@ for app_idx in ${!APPS[@]}; do
   printf "${name}-${opcode}"
   rows=$(collect_rows "placement_${name}_${opcode}" "Block")
   # print with labels
-  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\t\n\tCXL_DDR%s\n", lines[1], lines[2], lines[3], lines[4], lines[5], lines[6]) }'
+  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\t\n\tCXL_DDR%s\n\tDDR_CXL%s\n", lines[1], lines[2], lines[3], lines[4], lines[5], lines[6], lines[7]) }'
 
   # print gpCore (Baseline entries from same logs)
   printf "gpCore"
   rows=$(collect_rows "placement_${name}_${opcode}" "Baseline")
-  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\t\n\tCXL_DDR%s\n", lines[1], lines[2], lines[3], lines[4], lines[5], lines[6]) }'
+  awk -v r="$rows" 'BEGIN{ split(r,lines,"\n"); printf("\tL2D%s\n\tL2C%s\n\tLLC%s\n\tDDR%s\n\tCXL%s\t\n\tCXL_DDR%s\n\tDDR_CXL%s\n", lines[1], lines[2], lines[3], lines[4], lines[5], lines[6], lines[7]) }'
 done
