@@ -1735,6 +1735,7 @@ void dsa_offload(fcontext_transfer_t arg){
   idxd_desc *desc = args->desc;
   idxd_comp *comp = args->comp;
   enum cache_state c_state = args->c_state;
+  bool cc_en = true;
 
   if(c_state != CORE_NT){
     stream_into_cache(src, xfer_size);
@@ -1763,6 +1764,7 @@ void dsa_offload(fcontext_transfer_t arg){
     demote_buf((char *)src, xfer_size);
   }
   if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM || c_state == DDR_AND_CXL_DRAM){
+    cc_en = false;
     flush_range(src, xfer_size);
   }
 
@@ -1811,12 +1813,12 @@ void dsa_offload(fcontext_transfer_t arg){
   switch(args->opcode){
     case DSA_OPCODE_MEMMOVE:
       prepare_dsa_memcpy_desc_with_preallocated_comp(
-        desc, (uint64_t)src, (uint64_t)dst,
+        desc, (uint64_t)src, (uint64_t)dst, cc_en,
         (uint64_t)comp, xfer_size);
       break;
     case DSA_OPCODE_MEMFILL:
       prepare_dsa_memfill_desc_with_preallocated_comp(
-        desc, 0xdeadbeef, (uint64_t)src,
+        desc, 0xdeadbeef, (uint64_t)src, cc_en,
         (uint64_t)comp, xfer_size);
       break;
     default:
