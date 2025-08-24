@@ -169,6 +169,7 @@ enum cache_state {
   LLC,
   DRAM,
   CXL_DRAM,
+  CXL_AND_DDR_DRAM,
   L2_DIRTY_DEMOTE,
   L2_CLEAN_DEMOTE,
   LLC_DEMOTE,
@@ -1643,7 +1644,7 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM || c_state == CXL_DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1661,6 +1662,8 @@ void baseline_gpcore_mem_ops(fcontext_transfer_t arg){
     case DRAM:
       break;
     case CXL_DRAM:
+      break;
+    case CXL_AND_DDR_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1756,7 +1759,7 @@ void dsa_offload(fcontext_transfer_t arg){
   if(c_state == LLC || c_state == LLC_DEMOTE){
     demote_buf((char *)src, xfer_size);
   }
-  if(c_state == DRAM || c_state == CXL_DRAM){
+  if(c_state == DRAM || c_state == CXL_DRAM || c_state == CXL_AND_DDR_DRAM){
     flush_range(src, xfer_size);
   }
 
@@ -1774,6 +1777,8 @@ void dsa_offload(fcontext_transfer_t arg){
     case DRAM:
       break;
     case CXL_DRAM:
+      break;
+    case CXL_AND_DDR_DRAM:
       break;
     case L2_DIRTY_DEMOTE:
       demote_buf((char *)src, xfer_size);
@@ -1896,6 +1901,7 @@ void baseline_gpcore_decompress(fcontext_transfer_t arg){
       break;
     case DRAM:
     case CXL_DRAM:
+    case CXL_AND_DDR_DRAM:
       flush_range(src, xfer_size);
       break;
     default:
@@ -1991,6 +1997,7 @@ void iaa_offload(fcontext_transfer_t arg){
       break;
     case DRAM:
     case CXL_DRAM:
+    case CXL_AND_DDR_DRAM:
       flush_range(src, xfer_size);
       break;
     default:
@@ -2892,9 +2899,11 @@ int main(int argc, char **argv){
   dsa_args_t *dsa_args = NULL;
   char *src_bufs = NULL;
   char *dst_bufs = NULL;
-  int dsa_buf_node = 0;
+  int dsa_src_buf_node = 0;
+  int dsa_dst_buf_node = 0;
   int cxl_dram_node = 2; /* hardcoded for urbana */
-  struct numa_mem *dsa_buf_nm = NULL;
+  struct numa_mem *dsa_src_buf_nm = NULL;
+  struct numa_mem *dsa_dst_buf_nm = NULL;
   enum cache_state c_state = L2_DIRTY;
   enum dsa_opcode dsa_opcode = DSA_OPCODE_MEMMOVE;
 
@@ -3065,24 +3074,33 @@ int main(int argc, char **argv){
   dsa_args = (dsa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dsa_args_t), 0);
 
   if (c_state == CXL_DRAM){
-    dsa_buf_node = cxl_dram_node;
+    dsa_src_buf_node = cxl_dram_node;
+    dsa_dst_buf_node = cxl_dram_node;
+  } else if (c_state == CXL_AND_DDR_DRAM) {
+    dsa_src_buf_node = cxl_dram_node;
   }
-  dsa_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
+  dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
+  dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
 
-  src_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * payload_size, 0);
-  dst_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+  src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, total_requests * payload_size, 0);
+  dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
 
   iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
 
-  iaa_src_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * max_comp_size, 0);
-  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+  iaa_src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, total_requests * max_comp_size, 0);
+  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
 
-  rc = alloc_numa_mem(dsa_buf_nm, pg_size, dsa_buf_node);
+  rc = alloc_numa_mem(dsa_src_buf_nm, pg_size, dsa_src_buf_node);
   if (rc){
     PRINT("Failed to allocate DSA buffers\n");
     return -1;
   }
 
+  rc = alloc_numa_mem(dsa_dst_buf_nm, pg_size, dsa_dst_buf_node);
+  if (rc){
+    PRINT("Failed to allocate DSA buffers\n");
+    return -1;
+  }
 
   matrix_len = floor(sqrt(payload_size/sizeof(int)));
   mat_size_bytes = matrix_len * matrix_len * sizeof(int);
@@ -3158,6 +3176,7 @@ int main(int argc, char **argv){
 
   add_base_addr(nm, (void **)&dsa_src_buf);
   add_base_addr(nm, (void **)&dsa_dst_buf);
+
   add_base_addr(nm, (void **)&dl_bufs);
   add_base_addr(nm, (void **)&dl_args);
 
@@ -3166,13 +3185,13 @@ int main(int argc, char **argv){
   add_base_addr(nm, (void **)&dec_bufs);
   add_base_addr(nm, (void **)&cpyd_dec_bufs);
 
-  add_base_addr(dsa_buf_nm, (void **)&src_bufs);
-  add_base_addr(dsa_buf_nm, (void **)&dst_bufs);
+  add_base_addr(dsa_src_buf_nm, (void **)&src_bufs);
+  add_base_addr(dsa_dst_buf_nm, (void **)&dst_bufs);
   add_base_addr(nm, (void **)&dsa_args);
 
   add_base_addr(nm, (void **)&iaa_args);
-  add_base_addr(dsa_buf_nm, (void **)&iaa_src_bufs);
-  add_base_addr(dsa_buf_nm, (void **)&iaa_dst_bufs);
+  add_base_addr(dsa_src_buf_nm, (void **)&iaa_src_bufs);
+  add_base_addr(dsa_dst_buf_nm, (void **)&iaa_dst_bufs);
 
   add_base_addr(nm, (void **)&mmpc_args);
   add_base_addr(nm, (void **)&mm_data);
