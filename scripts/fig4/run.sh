@@ -20,10 +20,10 @@ IAA_DECOMPRESS=66
 iaa_opcodes=( ${IAA_DECOMPRESS} )
 
 
-for opcode in "${dsa_opcodes[@]}";
+for query_size in "${PAYLOAD_SIZES[@]}";
 do
   prefix="logs/placement_dsa_${opcode}"
-  for query_size in "${PAYLOAD_SIZES[@]}";
+  for opcode in "${dsa_opcodes[@]}";
   do
     for cstate in "${PLACEMENTS[@]}";
     do
