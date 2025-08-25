@@ -30,3 +30,35 @@ for p_idx in ${!PLACEMENTS[@]}; do
   done
   echo
 done
+printf "DSA_Memfill"
+for p_idx in ${!PLACEMENTS[@]}; do
+  placement=${PLACEMENTS[$p_idx]}
+  placement_name=${PLACEMENT_NAMES[$p_idx]}
+  printf "\t${placement_name}"
+  for payload_size in "${PAYLOAD_SIZES[@]}"; do
+    log="logs/placement_dsa_4_${payload_size}_cstate_${placement}.log"
+    if [[ ! -f "$log" ]]; then
+      val="-"
+    else
+      val=$(grep "Block" "$log" | awk '{print $5}')
+    fi
+    printf "\t%s" "$val"
+  done
+  echo
+done
+printf "IAA_Decompress"
+for p_idx in ${!PLACEMENTS[@]}; do
+  placement=${PLACEMENTS[$p_idx]}
+  placement_name=${PLACEMENT_NAMES[$p_idx]}
+  printf "\t${placement_name}"
+  for payload_size in "${PAYLOAD_SIZES[@]}"; do
+    log="logs/placement_iaa_66_${payload_size}_cstate_${placement}.log"
+    if [[ ! -f "$log" ]]; then
+      val="-"
+    else
+      val=$(grep "Block" "$log" | awk '{print $5}')
+    fi
+    printf "\t%s" "$val"
+  done
+  echo
+done
