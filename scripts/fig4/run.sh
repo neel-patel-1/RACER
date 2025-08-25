@@ -6,10 +6,10 @@ bin=exe_time
 make $bin -j
 
 # PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576 $(( 2 * 1024 * 1024 )) $(( 4 * 1024 * 1024 ))  $(( 8 * 1024 * 1024 )) $(( 16 * 1024 * 1024 )) $(( 32 * 1024 * 1024 )) $(( 64 * 1024 * 1024 )) $(( 128 * 1024 * 1024 )) $(( 256 * 1024 * 1024 )) $(( 512 * 1024 * 1024 )) $(( 1024 * 1024 * 1024 )) $(( 2 * 1024 * 1024 * 1024 )) )
-# PAYLOAD_SIZES=( $(( 32 * 1024 * 1024 )) $(( 64 * 1024 * 1024 )) $(( 128 * 1024 * 1024 )) $(( 256 * 1024 * 1024 )) $(( 512 * 1024 * 1024 )) $(( 1024 * 1024 * 1024 )) $(( 2 * 1024 * 1024 * 1024 ))  )
-PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576  )
+PAYLOAD_SIZES=( $(( 32 * 1024 * 1024 )) $(( 64 * 1024 * 1024 )) $(( 128 * 1024 * 1024 )) $(( 256 * 1024 * 1024 )) $(( 512 * 1024 * 1024 )) $(( 1024 * 1024 * 1024 )) $(( 2 * 1024 * 1024 * 1024 ))  )
+# PAYLOAD_SIZES=( 256 1024 4096 16384 65536 262144 1048576  )
 #PLACEMENTS=( 0 1 2 3 4 5 6 )
-PLACEMENTS=( 2 3 4 )
+PLACEMENTS=( 4 )
 
 dsa_app=8
 DSA_MEMMOVE=3
@@ -30,7 +30,7 @@ do
     do
       log="${prefix}_${query_size}_cstate_${cstate}.log"
       set -o pipefail
-      sudo ./$bin -i 1 -t 100 -a $dsa_app -o $opcode -s $query_size -l -2 -p $cstate -q -j 2>&1 | tee ${log}
+      sudo ./$bin -i 1 -t 100 -a $dsa_app -o $opcode -s $query_size -l -2 -p $cstate -q -j 2>&1
       rc=${PIPESTATUS[0]}
       if [[ $rc != 0 ]]; then
         echo "Error: Command failed with exit code $rc"

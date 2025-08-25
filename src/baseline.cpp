@@ -3064,44 +3064,91 @@ int main(int argc, char **argv){
   stack_ctxs =
     (uint8_t *)alloc_numa_offset(nm, total_requests * context_size, 0);
 
-  ser_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * max_payload_expansion, 0);
-  d_bufs = (char *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
 
-  ddh_args =
-    (ddh_args_t *)alloc_numa_offset(nm, total_requests * sizeof(ddh_args_t), 0);
+  switch (main_type){
+    case DESER_DECOMP_HASH:
+      ddh_args =
+        (ddh_args_t *)alloc_numa_offset(nm, total_requests * sizeof(ddh_args_t), 0);
+      ser_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * max_payload_expansion, 0);
+      d_bufs = (char *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
+      break;
+    case DECOMP_GATHER:
+    case MEMCPY_GATHER:
+      s_bufs = (char *)alloc_numa_offset(nm, total_requests * max_comp_size, 0);
+      g_buf = (int *)alloc_numa_offset(nm, num_accesses * sizeof(int), 0);
+      i_bufs = (float *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
+      o_bufs = (float *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
+      dg_args = (dg_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dg_args_t), 0);
+      break;
+    case SERIAL_ACCESSOR_DEP:
+    case SERIAL_ACCESSOR_DECOMP:
+    case SERIAL_ACCESSOR:
+      dl_args = (dl_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dl_args_t), 0);
+      dsa_src_buf = (uint8_t *)alloc_numa_offset(nm, max_ax_src_sz * total_requests, 0);
+      dsa_dst_buf = (uint8_t *)alloc_numa_offset(nm, avail_ax_dst_size * total_requests, 0);
+      dl_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * dl_buf_sz, 0);
+      break;
+    case DECRYPT_MEMCPY_DP:
+      dmdp_args = (dmdp_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dmdp_args_t), 0);
+      enc_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
+      dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
+      cpyd_dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
+      break;
+    case DSA_OFFLOAD:
+      if (c_state == CXL_DRAM){
+        dsa_src_buf_node = cxl_dram_node;
+        dsa_dst_buf_node = cxl_dram_node;
+      } else if (c_state == CXL_AND_DDR_DRAM) {
+        dsa_src_buf_node = cxl_dram_node;
+      } else if (c_state == DDR_AND_CXL_DRAM) {
+        dsa_dst_buf_node = cxl_dram_node;
+      }
+      dsa_args = (dsa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dsa_args_t), 0);
+      dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
+      dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
 
-  g_buf = (int *)alloc_numa_offset(nm, num_accesses * sizeof(int), 0);
-  s_bufs = (char *)alloc_numa_offset(nm, total_requests * max_comp_size, 0);
-  i_bufs = (float *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
-  dg_args = (dg_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dg_args_t), 0);
-  o_bufs = (float *)alloc_numa_offset(nm, total_requests * decomp_out_space, 0);
+      src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, payload_size, 0);
+      dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+      break;
+    case IAA_OFFLOAD:
+      if (c_state == CXL_DRAM){
+        dsa_src_buf_node = cxl_dram_node;
+        dsa_dst_buf_node = cxl_dram_node;
+      } else if (c_state == CXL_AND_DDR_DRAM) {
+        dsa_src_buf_node = cxl_dram_node;
+      } else if (c_state == DDR_AND_CXL_DRAM) {
+        dsa_dst_buf_node = cxl_dram_node;
+      }
+      dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
+      dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
 
-  dmdp_args = (dmdp_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dmdp_args_t), 0);
-  enc_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
-  dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
-  cpyd_dec_bufs = (char *)alloc_numa_offset(nm, total_requests * payload_size, 0);
+      iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
 
-  dsa_args = (dsa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dsa_args_t), 0);
-
-  if (c_state == CXL_DRAM){
-    dsa_src_buf_node = cxl_dram_node;
-    dsa_dst_buf_node = cxl_dram_node;
-  } else if (c_state == CXL_AND_DDR_DRAM) {
-    dsa_src_buf_node = cxl_dram_node;
-  } else if (c_state == DDR_AND_CXL_DRAM) {
-    dsa_dst_buf_node = cxl_dram_node;
+      iaa_src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, max_comp_size, 0);
+      iaa_dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+      break;
+    case MATMUL_MEMFILL_PCA:
+      matrix_len = floor(sqrt(payload_size/sizeof(int)));
+      mat_size_bytes = matrix_len * matrix_len * sizeof(int);
+      mmpc_args = (mmpc_args_t *)alloc_numa_offset(nm, total_requests * sizeof(mmpc_args_t), 0);
+      mm_data = (mm_data_t *)alloc_numa_offset(nm,sizeof(mm_data_t) * total_requests, 0);
+      mat_a = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
+      mat_b = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
+      mat_c = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
+      mean_vector = (int *)alloc_numa_offset(nm, total_requests * matrix_len * sizeof(int), 0);
+      break;
+    case UPDATE_FILTER_HISTOGRAM:
+      upd_args = (ufh_args_t *)alloc_numa_offset(nm, total_requests * sizeof(ufh_args_t), 0);
+      upd_bufs = (float *)alloc_numa_offset(nm, total_requests * payload_size, 0);
+      extracted_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * IAA_FILTER_MAX_DEST_SIZE, 0);
+      hist_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * hist_size, 0);
+      scat_buf = (int *)alloc_numa_offset(nm, num_accesses * sizeof(int), 0);
+      aecs = (uint8_t *)alloc_numa_offset(nm, IAA_FILTER_AECS_SIZE * 2 * total_requests, 0); /* enough space for each to get its own cache line*/
+      break;
+    default:
+      PRINT("Invalid main request type %d\n", main_type);
+      break;
   }
-  dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
-  dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
-
-  src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, payload_size, 0);
-  dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
-
-  iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
-
-  iaa_src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, max_comp_size, 0);
-  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
-
   rc = alloc_numa_mem(dsa_src_buf_nm, pg_size, dsa_src_buf_node);
   if (rc){
     PRINT("Failed to allocate DSA buffers\n");
@@ -3114,21 +3161,7 @@ int main(int argc, char **argv){
     return -1;
   }
 
-  matrix_len = floor(sqrt(payload_size/sizeof(int)));
-  mat_size_bytes = matrix_len * matrix_len * sizeof(int);
-  mmpc_args = (mmpc_args_t *)alloc_numa_offset(nm, total_requests * sizeof(mmpc_args_t), 0);
-  mm_data = (mm_data_t *)alloc_numa_offset(nm,sizeof(mm_data_t) * total_requests, 0);
-  mat_a = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
-  mat_b = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
-  mat_c = (int *)alloc_numa_offset(nm, total_requests * mat_size_bytes, 0);
-  mean_vector = (int *)alloc_numa_offset(nm, total_requests * matrix_len * sizeof(int), 0);
 
-  upd_args = (ufh_args_t *)alloc_numa_offset(nm, total_requests * sizeof(ufh_args_t), 0);
-  upd_bufs = (float *)alloc_numa_offset(nm, total_requests * payload_size, 0);
-  extracted_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * IAA_FILTER_MAX_DEST_SIZE, 0);
-  hist_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * hist_size, 0);
-  scat_buf = (int *)alloc_numa_offset(nm, num_accesses * sizeof(int), 0);
-  aecs = (uint8_t *)alloc_numa_offset(nm, IAA_FILTER_AECS_SIZE * 2 * total_requests, 0); /* enough space for each to get its own cache line*/
 
   switch(main_type){
     case SERIAL_ACCESSOR_DECOMP_DEP:
@@ -3151,10 +3184,6 @@ int main(int argc, char **argv){
       break;
   }
 
-  dl_args = (dl_args_t *)alloc_numa_offset(nm, total_requests * sizeof(dl_args_t), 0);
-  dsa_src_buf = (uint8_t *)alloc_numa_offset(nm, max_ax_src_sz * total_requests, 0);
-  dsa_dst_buf = (uint8_t *)alloc_numa_offset(nm, avail_ax_dst_size * total_requests, 0);
-  dl_bufs = (uint8_t *)alloc_numa_offset(nm, total_requests * dl_buf_sz, 0);
 
 
   rc = alloc_numa_mem(nm, pg_size, node);
@@ -3172,52 +3201,68 @@ int main(int argc, char **argv){
   add_base_addr(nm, (void **)&ts3);
   add_base_addr(nm, (void **)&ts4);
 
-  add_base_addr(nm, (void **)&f_args);
-  add_base_addr(nm, (void **)&f_inp);
-  add_base_addr(nm, (void **)&f_stack_ctxs);
-
-  add_base_addr(nm, (void **)&ddh_args);
-  add_base_addr(nm, (void **)&ser_bufs);
-  add_base_addr(nm, (void **)&d_bufs);
-
+  switch(main_type){
+  case DESER_DECOMP_HASH:
+    add_base_addr(nm, (void **)&ddh_args);
+    add_base_addr(nm, (void **)&ser_bufs);
+    add_base_addr(nm, (void **)&d_bufs);
+    break;
+  case DECOMP_GATHER:
+  case MEMCPY_GATHER:
   add_base_addr(nm, (void **)&g_buf);
   add_base_addr(nm, (void **)&s_bufs);
   add_base_addr(nm, (void **)&i_bufs);
   add_base_addr(nm, (void **)&dg_args);
   add_base_addr(nm, (void **)&o_bufs);
-
+  break;
+  case SERIAL_ACCESSOR_DEP:
+  case SERIAL_ACCESSOR_DECOMP:
+  case SERIAL_ACCESSOR:
   add_base_addr(nm, (void **)&dsa_src_buf);
   add_base_addr(nm, (void **)&dsa_dst_buf);
 
   add_base_addr(nm, (void **)&dl_bufs);
   add_base_addr(nm, (void **)&dl_args);
-
+  break;
+  case DECRYPT_MEMCPY_DP:
   add_base_addr(nm, (void **)&dmdp_args);
   add_base_addr(nm, (void **)&enc_bufs);
   add_base_addr(nm, (void **)&dec_bufs);
   add_base_addr(nm, (void **)&cpyd_dec_bufs);
-
+  break;
+    case DSA_OFFLOAD:
   add_base_addr(dsa_src_buf_nm, (void **)&src_bufs);
   add_base_addr(dsa_dst_buf_nm, (void **)&dst_bufs);
   add_base_addr(nm, (void **)&dsa_args);
-
+  break;
+  case IAA_OFFLOAD:
   add_base_addr(nm, (void **)&iaa_args);
   add_base_addr(dsa_src_buf_nm, (void **)&iaa_src_bufs);
   add_base_addr(dsa_dst_buf_nm, (void **)&iaa_dst_bufs);
-
+  break;
+  case MATMUL_MEMFILL_PCA:
   add_base_addr(nm, (void **)&mmpc_args);
   add_base_addr(nm, (void **)&mm_data);
   add_base_addr(nm, (void **)&mat_a);
   add_base_addr(nm, (void **)&mat_b);
   add_base_addr(nm, (void **)&mat_c);
   add_base_addr(nm, (void **)&mean_vector);
-
+  break;
+  case UPDATE_FILTER_HISTOGRAM:
   add_base_addr(nm, (void **)&upd_args);
   add_base_addr(nm, (void **)&upd_bufs);
   add_base_addr(nm, (void **)&extracted_bufs);
   add_base_addr(nm, (void **)&hist_bufs);
   add_base_addr(nm, (void **)&scat_buf);
   add_base_addr(nm, (void **)&aecs);
+  break;
+  default:
+    PRINT("Invalid main request type %d\n", main_type);
+    break;
+  }
+  add_base_addr(nm, (void **)&f_args);
+  add_base_addr(nm, (void **)&f_inp);
+  add_base_addr(nm, (void **)&f_stack_ctxs);
 
 
   memset(comp, 0, total_requests * sizeof(idxd_comp));
