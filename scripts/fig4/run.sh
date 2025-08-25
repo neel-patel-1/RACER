@@ -27,13 +27,14 @@ do
   do
     for cstate in "${PLACEMENTS[@]}";
     do
+      echo "Running DSA opcode $opcode, size $query_size, cstate $cstate"
       log="${prefix}_${query_size}_cstate_${cstate}.log"
       if [[ -f "$log" ]] && grep -q "Block" "$log"; then
         echo "exists... skipping $log"
         continue
       fi
       set -o pipefail
-      sudo ./$bin -i 1 -t 100 -a $dsa_app -o $opcode -s $query_size -l -2 -p $cstate -q -j 2>&1
+      sudo ./$bin -i 1 -t 100 -a $dsa_app -o $opcode -s $query_size -l -2 -p $cstate -q 2>&1 | tee ${log}
       rc=${PIPESTATUS[0]}
       if [[ $rc != 0 ]]; then
         echo "Error: Command failed with exit code $rc"
