@@ -3094,13 +3094,13 @@ int main(int argc, char **argv){
   dsa_src_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
   dsa_dst_buf_nm = (struct numa_mem *)calloc(nb_numa_node, sizeof(struct numa_mem));
 
-  src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, total_requests * payload_size, 0);
-  dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+  src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, payload_size, 0);
+  dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
 
   iaa_args = (iaa_args_t *)alloc_numa_offset(nm, total_requests * sizeof(iaa_args_t), 0);
 
-  iaa_src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, total_requests * max_comp_size, 0);
-  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, total_requests * IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
+  iaa_src_bufs = (char *)alloc_numa_offset(dsa_src_buf_nm, max_comp_size, 0);
+  iaa_dst_bufs = (char *)alloc_numa_offset(dsa_dst_buf_nm, IAA_DECOMPRESS_MAX_DEST_SIZE, 0); /* just provision for max offload size */
 
   rc = alloc_numa_mem(dsa_src_buf_nm, pg_size, dsa_src_buf_node);
   if (rc){
@@ -3433,8 +3433,8 @@ int main(int argc, char **argv){
       for(i=0; i<total_requests; i++){
         dsa_args[i].c_state = c_state;
         dsa_args[i].opcode = dsa_opcode;
-        dsa_args[i].src = &src_bufs[i * payload_size];
-        dsa_args[i].dst = &dst_bufs[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+        dsa_args[i].src = &src_bufs[0];
+        dsa_args[i].dst = &dst_bufs[0];
         dsa_args[i].desc = &desc[i];
         dsa_args[i].comp = &comp[i];
         dsa_args[i].xfer_size = payload_size;
@@ -3453,12 +3453,11 @@ int main(int argc, char **argv){
       switch(iaa_opcode){
         case IAX_OPCODE_DECOMPRESS:
           gen_comp_buf(payload_size, max_comp_size,
-              (void *)&iaa_src_bufs[i * max_comp_size], &(iaa_args[0].xfer_size), target_ratio);
+              (void *)&iaa_src_bufs[0], &(iaa_args[0].xfer_size), target_ratio);
           for(int i=0; i<total_requests; i++){
-            memcpy((void *)&iaa_src_bufs[i * max_comp_size], (void *)&iaa_src_bufs[0], max_comp_size);
             iaa_args[i].opcode = iaa_opcode;
-            iaa_args[i].src = &iaa_src_bufs[i * max_comp_size];
-            iaa_args[i].dst = &iaa_dst_bufs[i * IAA_DECOMPRESS_MAX_DEST_SIZE];
+            iaa_args[i].src = &iaa_src_bufs[0];
+            iaa_args[i].dst = &iaa_dst_bufs[0];
             iaa_args[i].desc = &desc[i];
             iaa_args[i].comp = &comp[i];
             iaa_args[i].xfer_size = iaa_args[0].xfer_size;
