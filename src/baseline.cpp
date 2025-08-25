@@ -3599,7 +3599,7 @@ int main(int argc, char **argv){
   // goto baseline;
   if(neither){
     return 0;
-  } else if(just_blocking && !just_blocking){
+  } else if(just_blocking && !just_baseline){
     goto blocking;
   }
 
