@@ -22,9 +22,20 @@ for p_idx in ${!PLACEMENTS[@]}; do
   for payload_size in "${PAYLOAD_SIZES[@]}"; do
     log="logs/placement_dsa_3_${payload_size}_cstate_${placement}.log"
     if [[ ! -f "$log" ]]; then
+      printf "Log %s does not exist\n" "$log" >&2
       val="-"
     else
-      val=$(grep "Block" "$log" | awk '{print $5}')
+      if [[ ! -s "$log" ]]; then
+        printf "Log %s is empty\n" "$log" >&2
+        val="E"
+      else
+        if ! grep -q "Block" "$log"; then
+          printf "Log %s is incomplete\n" "$log" >&2
+          val="E"
+        else
+          val=$(grep "Block" "$log" | awk '{print $5}')
+        fi
+      fi
     fi
     printf "\t%s" "$val"
   done

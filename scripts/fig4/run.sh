@@ -22,9 +22,9 @@ iaa_opcodes=( ${IAA_DECOMPRESS} )
 
 for query_size in "${PAYLOAD_SIZES[@]}";
 do
-  prefix="logs/placement_dsa_${opcode}"
   for opcode in "${dsa_opcodes[@]}";
   do
+    prefix="logs/placement_dsa_${opcode}"
     for cstate in "${PLACEMENTS[@]}";
     do
       echo "Running DSA opcode $opcode, size $query_size, cstate $cstate"
