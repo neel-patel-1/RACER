@@ -132,6 +132,7 @@ preempt_bench --mode overhead|latency|signal-floor [options]
 | Filler | Library | Work |
 |---|---|---|
 | `deserialize` | protobuf | parse a `RouterRequest` |
+| `serialize` | protobuf | `ByteSizeLong` and `SerializeToArray` of a `RouterRequest` |
 | `decrypt` | ipp-crypto | one `ippsAES_GCMDecrypt` call |
 | `decrypt-chunked` | ipp-crypto + `aes_gcm_chunked` | one call for each 4 KiB |
 | `matmul`, `histogram`, `dotproduct`, `gather`, `scatter-update`, `hash`, `sequential-writer` | RACER kernels | the kernel of the same name |

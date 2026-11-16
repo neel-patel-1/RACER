@@ -22,6 +22,7 @@ scheduler running again (latency = detect + switch):
   switch            the probe point to the scheduler running again
 """
 import csv
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -33,7 +34,9 @@ def read_rows(path):
 
 
 def format_ns(ns):
-    if ns is None:
+    # nan: no run of the row has the value (a detect median when no run sees
+    # the completion before the filler ends)
+    if ns is None or math.isnan(ns):
         return "—"
     if abs(ns) >= 1e6:
         return f"{ns / 1e6:.2f} ms"

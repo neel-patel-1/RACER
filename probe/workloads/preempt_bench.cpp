@@ -210,6 +210,38 @@ class DeserializeFiller : public Filler {
   router::RouterRequest parsed_request;
 };
 
+// The serialize step of RACER's gen_ser_buf (src/baseline.cpp): the size and
+// the bytes of a router request with RACER's key and a value of size_bytes.
+// RACER serializes only in its setup code, so there no probe point yields; this
+// filler measures the probes that the serializer would have if it yielded. The
+// probe points are in the protobuf serializer and in router.pb.cc; the copy of
+// the value is glibc memcpy, which has none.
+class SerializeFiller : public Filler {
+ public:
+  SerializeFiller(size_t size_bytes, std::mt19937_64 &random) {
+    request.set_key("/region/cluster/foo:key|#|etc");
+    std::vector<uint8_t> value = random_bytes(size_bytes, random);
+    request.set_value(value.data(), value.size());
+    request.set_operation(1);
+    serialized_request.resize(request.ByteSizeLong());
+  }
+  void run() override {
+    size_t request_bytes = request.ByteSizeLong();
+    if (request_bytes != serialized_request.size() ||
+        !request.SerializeToArray(serialized_request.data(), static_cast<int>(request_bytes))) {
+      fprintf(stderr, "serialize: the router request does not serialize\n");
+      abort();
+    }
+  }
+  uint64_t checksum() const override {
+    return fnv1a_64(serialized_request.data(), serialized_request.size());
+  }
+
+ private:
+  router::RouterRequest request;
+  std::vector<uint8_t> serialized_request;
+};
+
 // RACER's decrypt step (include/inline/decrypt.ipp): AES-128-GCM with RACER's
 // key and IV. chunk_bytes 0 decrypts with one ippsAES_GCMDecrypt call, as
 // RACER does; other values decrypt with one call a chunk (aes_gcm_chunked.h).
@@ -468,6 +500,7 @@ struct FillerKind {
 
 static const FillerKind filler_kinds[] = {
     {"deserialize", make_filler<DeserializeFiller>},
+    {"serialize", make_filler<SerializeFiller>},
     {"decrypt", make_filler<OneCallDecryptFiller>},
     {"decrypt-chunked", make_filler<ChunkedDecryptFiller>},
     {"matmul", make_filler<MatmulFiller>},
