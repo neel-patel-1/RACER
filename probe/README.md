@@ -270,6 +270,41 @@ probe points are evenly spaced in time.
 - With `aesni`, one `decrypt` call takes 35 µs and does not yield;
   `decrypt-chunked` yields with a 1.4 µs median (measured on emerald-01).
 
+### Protobuf by input size
+
+`serialize` and `deserialize` at four sizes of the `bytes` value, with the
+filler on CPU 38 and the accelerator thread on CPU 40 (second socket: jobs of
+another user ran on cores 7-14 of the first socket). Signal floor 192-193 ns.
+10 sweeps of 2000 runs, as in the overhead table.
+
+| Value | Filler | Runtime (off) | Off spread | Probes a run 0 / 200 | Overhead 0 / 200 | Yields 0 / 200 | Latency median 0 / 200 / off |
+|---|---|---|---|---|---|---|---|
+| 64 B | `serialize` | 72 ns | 5.6 % | 8 / 2 | +5.6 / +8.3 % | 0 / 0 | — |
+| 64 B | `deserialize` | 126 ns | 2.4 % | 12 / 6 | +0.8 / +8.7 % | 0 / 1 | 42 / 45 / 47 ns |
+| 4 KiB | `serialize` | 142 ns | 0.7 % * | 9 / 3 | +2.8 / +7.7 % | 0 / 0 | 54 / 45 / 45 ns |
+| 4 KiB | `deserialize` | 218 ns | 0.9 % | 12 / 6 | +0.9 / +6.4 % | 896 / 970 | 221 / 224 / 138 ns |
+| 64 KiB | `serialize` | 2.09 µs | 25.4 % | 10 / 3 | +0.5 / +0.5 % | 0 / 0 | 1.23 / 1.24 / 1.23 µs |
+| 64 KiB | `deserialize` | 4.10 µs | 1.5 % | 12 / 6 | +0.4 / +0.5 % | 1000 / 1000 | 2.26 / 2.28 / 2.25 µs |
+| 1 MiB | `serialize` | 48.0 µs | 9.1 % | 10 / 3 | +1.1 / −1.1 % | 1 / 0 | 28.1 / 28.4 / 27.8 µs |
+| 1 MiB | `deserialize` | 76.5 µs | 6.7 % | 12 / 6 | −0.2 / −0.7 % | 1000 / 1000 | 43.2 / 44.4 / 43.9 µs |
+
+\* 149 % with one slow sweep of `off` (353 ns); the other nine are 141-142 ns.
+
+- The value size does not change the probe count: one call executes 2 to 12
+  probe points, and the copy of the value (one glibc `memcpy`) executes none.
+- Up to 4 KiB the added time is 1-4 ns a call at interval 0 and 6-14 ns at
+  interval 200, the same at both sizes. It is a large share only because a
+  small message takes 70-220 ns. At 64 KiB and up the overhead is inside
+  the spread of `off`.
+- Interval 200 costs more than interval 0 with fewer probe points, as in
+  `gather`. The cause is not studied yet.
+- `serialize` does not yield: it executes no probe point after the copy of
+  the value starts. RACER serializes only in its setup code.
+- `deserialize` yields only after the copy, so its latency equals the latency
+  of the `off` build. Up to 4 KiB the call is shorter than the signal floor, so
+  a yield cannot come sooner than the end of the call: at 4 KiB the yield
+  makes the latency 83 ns longer.
+
 ### Accelerator placement
 
 The 7 RACER kernels at interval 200, with the accelerator thread on three
@@ -304,7 +339,8 @@ unrolled and has no header left to probe.
 - **Code with no loops in IR gets no probes.** The pass probes loop headers
   only; there are no function-entry probes.
   - The `bytes` field of `RouterRequest` is copied by one `memcpy`, so
-    `deserialize` waits for the copy.
+    `deserialize` waits for the copy, and `serialize` executes no probe
+    point after the copy starts.
   - The protobuf table-driven parser chains field handlers with `musttail`
     calls, which are not loops.
   - ipp-crypto GCM on AVX-512 CPUs (`native`) and with AES-NI (`aesni`) runs in
