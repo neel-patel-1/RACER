@@ -1,0 +1,3 @@
+add_library(racer_probe_runtime STATIC racer_probe_runtime.c)
+target_include_directories(racer_probe_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(racer_probe_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)

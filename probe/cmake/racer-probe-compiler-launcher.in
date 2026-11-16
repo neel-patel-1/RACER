@@ -1,0 +1,11 @@
+#!/bin/sh
+# Compiler launcher for third-party builds: CMake runs every compile step as
+# `<launcher> <compiler> <arguments>`, and never runs link steps through it.
+# The probe flags therefore reach compiles only, and -Werror builds see no
+# unused-argument warning at link time.
+#   -fpass-plugin            runs RacerProbePass at the end of the optimizer
+#   -Xclang -load            loads the plugin early, so -mllvm knows its option
+exec "$@" \
+  -fpass-plugin=@RACER_PROBE_PLUGIN@ \
+  -Xclang -load -Xclang @RACER_PROBE_PLUGIN@ \
+  -mllvm -racer-probe-interval=@RACER_PROBE_INTERVAL@

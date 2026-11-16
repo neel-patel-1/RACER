@@ -28,3 +28,4 @@ exe_time
 numa_effect
 throughput
 
+probe/build/

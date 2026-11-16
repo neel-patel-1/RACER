@@ -4,3 +4,6 @@
 [submodule "third-party/ipp-crypto"]
 	path = third-party/ipp-crypto
 	url = https://github.com/intel/ipp-crypto.git
+[submodule "third-party/protobuf"]
+	path = third-party/protobuf
+	url = https://github.com/protocolbuffers/protobuf.git
