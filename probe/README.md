@@ -8,10 +8,10 @@ probe points, through an LLVM 17 pass plugin:
 - ipp-crypto (`third-party/ipp-crypto`), all C code of the merged build
 - the RACER kernels (`src/kernels/*.cpp`)
 
-`preempt_bench` runs each library as a filler next to an emulated accelerator
-and measures the probe overhead and the preemption latency. There is no
-IAA or DSA device on the lab hosts, so the accelerator is a pinned thread that
-writes a completion record at a chosen time.
+`preempt_bench` runs each library as a filler next to an accelerator and
+measures the probe overhead and the preemption latency. The accelerator is
+an emulated accelerator (a pinned thread that writes a completion record at a
+chosen time) or an Intel QAT device (see [QAT accelerator](#qat-accelerator)).
 
 `pass/` replaces `src/XMPPass` (a legacy pass manager pass) for use as a clang
 plugin with the new pass manager. It keeps the symbol names and the
@@ -27,7 +27,7 @@ plugin with the new pass manager. It keeps the symbol names and the
 | `CMakeLists.txt` | the superbuild: abseil, protobuf, ipp-crypto, workloads |
 | `workloads/` | `racer_kernels`, `racer_router_proto`, `aes_gcm_chunked`, `preempt_bench` |
 | `test/pass/*.ll` | `opt` tests of the pass, run by `ctest` |
-| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py` |
+| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py`, `run-qat-bench.sh`, `summarize-qat.py` |
 
 ## Usage
 
@@ -40,6 +40,8 @@ probe/scripts/build.sh off   # same libraries, no probes (baseline)   -> build/o
 probe/scripts/count-probes.sh probe/build/interval-200
 probe/scripts/run-bench.sh results/today --cpu 2 --accelerator-cpu 4
 probe/scripts/summarize.py results/today
+probe/scripts/run-qat-bench.sh results/qat 38 110 --size 1048576   # filler CPU, observer CPU
+probe/scripts/summarize-qat.py results/qat
 ```
 
 One build directory holds one configuration. The third-party builds do not track the plugin: after a change
@@ -51,6 +53,7 @@ modes and writes `overhead.csv` (`OVERHEAD_SWEEPS` sweeps over the builds,
 default 10), `latency.csv`, `samples-<build>.csv` (each latency run) and
 `signal-floor.csv`. The arguments after the output directory go to each run.
 `summarize.py` joins these CSVs into the tables of [Results](#results).
+`run-qat-bench.sh` and `summarize-qat.py` do the same for the QAT modes.
 
 To probe another library, compile it with
 
@@ -114,17 +117,23 @@ nothing.
 ## preempt_bench
 
 ```
-preempt_bench --mode overhead|latency|signal-floor [options]
+preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor
+              [options]
   --filler NAME        a filler, or all (default); repeat for more than one
   --size BYTES         input size of each filler, a multiple of 64 (default 65536)
-  --runs N             measured runs (default 2000 overhead, 1000 latency,
-                       10000 signal-floor)
+  --runs N             measured runs (default 2000 overhead, 1000 latency and
+                       qat-latency, 10000 signal-floor and qat-floor)
   --cpu N              CPU of the filler (default 2)
   --accelerator-cpu N  CPU of the emulated accelerator (default 4)
+  --observer-cpu N     qat modes: CPU of the completion observer (default 6)
+  --offload-bytes N    qat modes: bytes of each QAT decrypt, a multiple of 16,
+                       at most 65536 (default 4096)
+  --idle-us N          qat-floor mode: the device is idle for N us before each
+                       offload (default 0)
   --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]
                        in latency mode, 1000 in signal-floor mode
   --seed N             seed of the inputs and the offload times of each filler
-  --samples PATH       latency mode: also write each run to PATH
+  --samples PATH       latency and qat-latency modes: also write each run to PATH
   --ipp-code-path P    GCM code of ipp-crypto: native, aesni or portable-c
   --no-header          do not print the CSV header
 ```
@@ -334,6 +343,180 @@ At 200 there are fewer call sites than at 0: the unroll phase caps the count
 at the maximum trip count, so a loop with a small constant trip count is fully
 unrolled and has no header left to probe.
 
+## QAT accelerator
+
+The qat modes use a real accelerator: an Intel QAT 4xxx device decrypts the
+offload. The probe points and the filler builds do not change. Only the
+completion byte changes: it is in the io_event that the kernel writes when the
+device completes the request.
+
+### Why QAT and not DSA or IAA
+
+The lab hosts have DSA and IAA devices, but a user cannot submit work to them:
+
+- all DSA devices and their work queues are disabled;
+- the IAA devices have only the kernel work queue of the `iaa_crypto` driver;
+- there is no `/dev/dsa` or `/dev/iax`. A user work queue needs root
+  (`accel-config` or `scripts/accel_conf.py`).
+
+The QAT devices (8086:4940: 8 on emerald-02, 4 on emerald-01 and emerald-03)
+are open to users through the kernel crypto API (AF_ALG sockets): the
+`qat_4xxx` driver gives `qat_aes_cbc`, `qat_aes_ctr` and `qat_aes_xts`. This
+needs no root and no device setup. `/dev/qat_adf_ctl` (the QAT user-space library) needs root. On
+sapphire the QAT functions are bound to vfio for the `qat` group, and the user
+is not in it. So the runs are on emerald-02.
+
+### How a QAT offload completes
+
+`QatDecryptOffload` does one AES-128-CBC decrypt at a time:
+
+1. `sendmsg` on the AF_ALG operation socket gives the kernel the ciphertext,
+   the operation and the IV. The kernel copies the ciphertext.
+2. `io_submit` of a read (`IOCB_CMD_PREAD`) of the plaintext starts the
+   decrypt on the device and returns at once (`-EIOCBQUEUED` in the kernel).
+3. The device raises its MSI-X interrupt on one CPU. The completion
+   (`af_alg_async_cb`, then `aio_complete`) writes the io_event into the AIO
+   ring at `events[tail]`, then moves `tail` on.
+4. The AIO ring is mapped into user memory by `io_setup`. Before the submit,
+   `prepare()` clears the `data` field of `events[tail]`; the completion sets it
+   to 1 (`aio_data`). The low byte of `data` is the completion byte that
+   `preempt_signal` points to.
+5. After the run, `io_getevents` takes the event, and the output is compared
+   with the plaintext. The ciphertext is made by ipp-crypto.
+
+The constructor runs one offload and stops if the byte is not set or the
+output is wrong. The driver binds by its driver name: `cbc(aes)` binds AES-NI,
+which has a higher priority than QAT. The kernel picks the QAT instance on the
+NUMA node of the CPU that sets the key, so the filler CPU sets the interrupt
+CPU.
+
+The device gives no completion time stamp. A `CompletionObserver` thread on
+its own CPU loads the completion byte in a tight loop and reads the TSC when
+the byte is set. So the detect time is from the observer seeing the byte.
+`observer-lag.csv` (signal-floor from the interrupt CPU to the observer CPU)
+gives the time from the kernel write to the observer seeing the byte; the
+"from write" columns add its median.
+
+- **qat-latency** is latency mode with the QAT offload. The completion time
+  is the device time, not a chosen time, so the filler must run longer than
+  the offload: `--size 1048576`.
+- **qat-floor** loads the completion byte in a tight loop on the filler CPU,
+  with no filler. The floor is the filler CPU seeing the byte minus the
+  observer seeing it. It also gives the offload time at each size and after
+  `--idle-us` of device idle.
+
+CSV columns:
+
+- qat-latency: `mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,yielded,finished_after_completion,finished_before_completion,wrong_outputs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,detect_median_ns,detect_p90_ns,detect_p99_ns,switch_median_ns,switch_p90_ns,switch_p99_ns,filler_median_ns`
+- `--samples`: `probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct`
+- qat-floor: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns`
+
+### QAT results
+
+Measured on emerald-02, filler on CPU 38 (second socket), 1 MiB inputs and
+4 KiB offloads, unless a row says other. The QAT instance of the second
+socket (`qat4-bundle1`) gives its interrupt on CPU 113. All filler and
+offload outputs are correct, and no offload fails.
+
+#### Offload
+
+`qat-floor`, observer on CPU 110 (the SMT sibling of the filler CPU), 10,000
+runs (200 runs with device idle).
+
+| Offload | Device idle before | Submit median | Offload median | Offload p10 / p90 / p99 | Interrupts an offload | Done in submit | Floor median (p10 / p90) |
+|---|---|---|---|---|---|---|---|
+| 16 B | 0 | 7.68 µs | 14.7 µs | 14.3 / 15.1 / 26.7 µs | 1.00 | 0 / 10000 | −3 ns (−9 / 8) |
+| 4 KiB | 0 | 8.55 µs | 18.2 µs | 17.8 / 18.6 / 30.6 µs | 1.00 | 1 / 10000 | 3 ns (−9 / 8) |
+| 64 KiB | 0 | 43.5 µs | 88.1 µs | 86.7 / 99.3 / 149.3 µs | 1.00 | 0 / 10000 | 3 ns (−8 / 8) |
+| 4 KiB | 100 µs | 8.52 µs | 18.3 µs | 18.0 / 19.1 / 46.7 µs | 1.02 | 0 / 200 | −3 ns (−9 / 8) |
+| 4 KiB | 1 ms | 8.60 µs | 19.1 µs | 18.7 / 46.4 / 47.4 µs | 1.21 | 0 / 200 | −5 ns (−9 / 8) |
+| 4 KiB | 10 ms | 9.20 µs | 47.9 µs | 47.0 / 48.6 / 57.2 µs | 2.91 | 0 / 200 | 3 ns (−8 / 8) |
+| 4 KiB | 100 ms | 9.57 µs | 48.8 µs | 48.2 / 50.0 / 63.2 µs | 2.81 | 0 / 200 | 5 ns (−9 / 8) |
+
+- The device is asynchronous: `io_submit` returns before the completion on
+  all runs but one of 10,000 (a slow submit).
+- The submit (the copy into the kernel and the request to the device) is
+  about half of the offload. An offload costs about 14 µs and then about
+  1.1 µs a KiB: one request at a time, not the peak rate of the device.
+- After 10 ms or more of device idle, an offload takes 48 µs and gives about
+  two more QAT interrupts (on `qat4-ae-cluster`): the device comes out of a
+  power state. After 1 ms of idle, 10 % or more of the offloads pay this.
+- On the SMT sibling the floor is −9 to 8 ns: the filler CPU sees the byte at
+  the same time as the observer. So the detect times below start when the
+  byte gets to the filler core.
+
+#### Latency
+
+`qat-latency`, observer on CPU 110, 1000 runs. The offload starts with the
+filler, so the device sets the completion time. Observer lag (signal-floor
+from CPU 113 to CPU 110) is 192 ns; "from write" adds it. Detect, switch and
+latency are at interval 200; where the probe points are dense, interval 0
+gives the same within 20 ns.
+
+| Filler | Runtime (off) | Offload median | Yields 0 / 200 | Detect median / p99 | Switch median / p99 | Latency from write median / p99 | Latency off median |
+|---|---|---|---|---|---|---|---|
+| `deserialize` | 75.3 µs | 21.0 µs | 1000 / 1000 | 68.5 / 74.4 µs | 93 / 132 ns | 68.7 / 74.7 µs | 66.3 µs |
+| `serialize` | 47.2 µs | 21.2 µs | 0 / 0 | 39.8 / 44.8 µs | 91 / 123 ns | 40.1 / 45.1 µs | 39.5 µs |
+| `decrypt` | 97.9 µs | 20.6 µs | 0 / 0 | 84.6 / 91.6 µs | 84 / 93 ns | 84.8 / 91.9 µs | 88.9 µs |
+| `decrypt-chunked` | 108.3 µs | 20.9 µs | 999 / 999 | 129 / 340 ns | 56 / 123 ns | 392 / 619 ns | 100.1 µs |
+| `matmul` | 86.22 ms | 48.9 µs | 1000 / 1000 | 18 / 28 ns | 53 / 63 ns | 263 / 278 ns | 86.20 ms |
+| `histogram` | 546.5 µs | 19.1 µs | 1000 / 1000 | 20 / 29 ns | 42 / 60 ns | 254 / 274 ns | 538.2 µs |
+| `dotproduct` | 476.7 µs | 18.5 µs | 1000 / 1000 | 16 / 21 ns | 39 / 48 ns | 247 / 259 ns | 467.4 µs |
+| `gather` | 268.3 µs | 21.7 µs | 1000 / 1000 | 51 / 58 ns | 54 / 99 ns | 297 / 345 ns | 258.9 µs |
+| `scatter-update` | 463.4 µs | 22.0 µs | 1000 / 1000 | 52 / 66 ns | 54 / 65 ns | 298 / 317 ns | 454.4 µs |
+| `hash` | 239.0 µs | 18.4 µs | 1000 / 1000 | 15 / 21 ns | 40 / 48 ns | 247 / 257 ns | 229.7 µs |
+| `sequential-writer` | 15.2 µs | 19.2 µs | 744 / 740 | 20 / 25 ns | 53 / 65 ns | 264 / 279 ns | 5.86 µs |
+
+- Where the probe points are dense, the latency from the kernel write is
+  247-298 ns median and at most 345 ns p99. This is the latency of the
+  emulated accelerator on another core of the socket (244-265 ns): 192 ns
+  to move the cache line from the interrupt CPU, 15-52 ns to the next probe
+  point and 39-56 ns to switch. The real device adds no other delay to the
+  preemption.
+- `gather` and `scatter-update` detect in about 50 ns, the other kernels in
+  15-20 ns. At 1 MiB their loads miss the cache, and the yield retires only
+  after the older loads. This cause is not measured.
+- `decrypt-chunked` detects in 129 ns: the wait for the end of a chunk.
+  `deserialize` yields only after the `bytes` copy; `serialize` and `decrypt`
+  (native) do not yield. This is the same as with the emulated accelerator.
+- The offload is 18-22 µs, not 18.2 µs as in `qat-floor`: the filler
+  removes the kernel data from the cache. `matmul` (86 ms a run) leaves the
+  device idle for 86 ms, so each of its offloads pays the power state
+  (49 µs).
+- `sequential-writer` (15 µs) ends before the device in 26 % of the runs.
+
+#### Placement
+
+`run-qat-bench.sh` with three CPU placements. The interrupt is on CPU 113 in
+each placement (the filler CPU picks the QAT instance, and the kernel the
+interrupt CPU of the instance). The latency columns are the dense kernels
+(`matmul`, `histogram`, `dotproduct`, `gather`, `scatter-update`, `hash`,
+`sequential-writer`) at interval 200.
+
+| Placement | Filler / observer CPU | Floor median (p10 / p90) | Observer lag | Submit / offload median, 4 KiB | Latency from write median | Latency from write p99 |
+|---|---|---|---|---|---|---|
+| Observer on the SMT sibling | 38 / 110 | 3 ns (−9 / 8) | 192 ns | 8.55 / 18.2 µs | 247-298 ns | 257-345 ns |
+| Observer on another core | 38 / 40 | −55 ns (−71 / 68) | 191 ns | 6.91 / 16.7 µs | 195-345 ns | 318-460 ns |
+| Filler on the interrupt CPU | 113 / 41 | 466 ns (459 / 478) | 64 ns | 7.71 / 16.8 µs | 596-739 ns | 644-862 ns |
+
+- The observer on the SMT sibling gives the time at which the byte gets to
+  the filler core (floor within 9 ns). But its spin loop shares the core
+  with the filler CPU: the submit takes 1.6 µs (24 %) more than with the
+  observer on another core. The filler runtimes do not change.
+- The observer on another core sees the byte 55 ns before or 68 ns after the
+  filler CPU (two modes), so its detect times also have two modes (−40 or
+  +65 ns). Inside this spread, the latency is the same as with the observer
+  on the sibling.
+- When the filler runs on the interrupt CPU, it sees the byte 466 ns after
+  the observer on the sibling (530 ns after the write). The filler runs
+  again only when the interrupt handler and the completion in softirq end.
+  So the latency is more than two times the latency with the interrupt on
+  another CPU. A user cannot move the interrupt (`smp_affinity` needs root),
+  but can put the filler on another CPU of the same NUMA node.
+- On the interrupt CPU, `decrypt-chunked` detects in 1.7-1.9 µs (129 ns
+  with the interrupt on another CPU), and its `off` runtime is 12-16 µs longer
+  (120 µs). The cause is not studied yet.
+
 ## Limits
 
 - **Code with no loops in IR gets no probes.** The pass probes loop headers
@@ -356,12 +539,12 @@ unrolled and has no header left to probe.
   probed inside protobuf.
 - **All ipp-crypto C code is probed**, not only the GCM files that RACER-Old
   probed.
-- **The accelerator is emulated.** A core writes the completion record, so
-  the signal floor is a core-to-core cache-line transfer. A device writes the
-  record from the I/O fabric, so its floor is different and is not measured
-  here. With an IAA or DSA device, an administrator
-  must first configure the work queues (`accel-config`, or
-  `scripts/accel_conf.py`); the RACER applications in `src/` are not yet linked
-  to these probed builds.
+- **The QAT completion goes through the kernel.** The device does not write
+  the completion byte: the kernel does, in the interrupt of the device. So the
+  QAT detect time includes a cache-line transfer from the interrupt CPU, as
+  with the emulated accelerator. DSA and IAA write a completion record from
+  the device, but they need an administrator: see
+  [Why QAT](#why-qat-and-not-dsa-or-iaa). The RACER applications in `src/` are
+  not yet linked to these probed builds.
 - **Use idle CPUs for the bench.** On a loaded host, `late_completions` rises
   and the latency includes the delay of the accelerator thread.

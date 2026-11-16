@@ -1,5 +1,5 @@
 // preempt_bench: probe-point accelerator preemption with an emulated
-// accelerator.
+// accelerator and with an Intel QAT device.
 //
 // This file is the application and is not probed. The fillers it runs call
 // probed code: the RACER kernels, protobuf (with the generated router.pb.cc)
@@ -23,21 +23,38 @@
 //                 its end and checks its output.
 //   signal-floor  measures the least detect time: the filler CPU loads the
 //                 status byte in a tight loop, with no filler and no fiber.
+//   qat-latency   latency mode with a QAT device in place of the emulated
+//                 accelerator: the offload is an AES-CBC decrypt through the
+//                 kernel crypto API, and the completion byte is in the
+//                 io_event that the kernel writes when the device interrupt
+//                 completes the request. An observer thread on its own CPU
+//                 gives the completion time.
+//   qat-floor     the least detect time of qat-latency: the filler CPU loads
+//                 the completion byte in a tight loop. Also the offload time.
 #include <getopt.h>
+#include <linux/aio_abi.h>
+#include <linux/if_alg.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <x86intrin.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -594,6 +611,334 @@ class EmulatedAccelerator {
 };
 
 // ---------------------------------------------------------------------------
+// QAT accelerator
+//
+// An Intel QAT device (4xxx) decrypts through the Linux kernel crypto API:
+// AF_ALG sockets and Linux AIO. This needs no root and no device setup. When
+// the device is done, its interrupt handler completes the AIO request: the
+// kernel writes an io_event into the AIO ring, which io_setup maps into user
+// memory. The first byte of that io_event is the completion byte that the
+// probe points load.
+
+#ifndef SOL_ALG
+#define SOL_ALG 279
+#endif
+
+static void exit_with_system_error(const char *what) {
+  fprintf(stderr, "%s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+constexpr size_t aes_block_bytes = 16;
+
+// One AF_ALG skcipher transform with one key, bound to a kernel crypto driver
+// by its driver name.
+class AfAlgSkcipher {
+ public:
+  AfAlgSkcipher(const char *driver_name, const uint8_t *key, size_t key_bytes) {
+    transform_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (transform_fd < 0) {
+      exit_with_system_error("socket(AF_ALG)");
+    }
+    sockaddr_alg address = {};
+    address.salg_family = AF_ALG;
+    snprintf(reinterpret_cast<char *>(address.salg_type), sizeof address.salg_type, "skcipher");
+    snprintf(reinterpret_cast<char *>(address.salg_name), sizeof address.salg_name, "%s",
+             driver_name);
+    if (bind(transform_fd, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0) {
+      fprintf(stderr, "cannot bind the kernel crypto driver %s: %s\n", driver_name,
+              strerror(errno));
+      exit(1);
+    }
+    if (setsockopt(transform_fd, SOL_ALG, ALG_SET_KEY, key, key_bytes) != 0) {
+      exit_with_system_error("setsockopt(ALG_SET_KEY)");
+    }
+    operation_fd = accept(transform_fd, nullptr, nullptr);
+    if (operation_fd < 0) {
+      exit_with_system_error("accept(AF_ALG)");
+    }
+  }
+  ~AfAlgSkcipher() {
+    close(operation_fd);
+    close(transform_fd);
+  }
+  AfAlgSkcipher(const AfAlgSkcipher &) = delete;
+  AfAlgSkcipher &operator=(const AfAlgSkcipher &) = delete;
+
+  // Gives the kernel the input of one operation (ALG_OP_ENCRYPT or
+  // ALG_OP_DECRYPT) and its 16-byte IV. The kernel copies the input; a read of
+  // the operation socket starts the operation.
+  void send_request(uint32_t operation, const uint8_t *iv, const uint8_t *input, size_t length) {
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof operation) +
+                                  CMSG_SPACE(sizeof(af_alg_iv) + aes_block_bytes)] = {};
+    iovec input_vector = {const_cast<uint8_t *>(input), length};
+    msghdr message = {};
+    message.msg_iov = &input_vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof control;
+    cmsghdr *operation_header = CMSG_FIRSTHDR(&message);
+    operation_header->cmsg_level = SOL_ALG;
+    operation_header->cmsg_type = ALG_SET_OP;
+    operation_header->cmsg_len = CMSG_LEN(sizeof operation);
+    memcpy(CMSG_DATA(operation_header), &operation, sizeof operation);
+    cmsghdr *iv_header = CMSG_NXTHDR(&message, operation_header);
+    iv_header->cmsg_level = SOL_ALG;
+    iv_header->cmsg_type = ALG_SET_IV;
+    iv_header->cmsg_len = CMSG_LEN(sizeof(af_alg_iv) + aes_block_bytes);
+    af_alg_iv *iv_data = reinterpret_cast<af_alg_iv *>(CMSG_DATA(iv_header));
+    iv_data->ivlen = aes_block_bytes;
+    memcpy(iv_data->iv, iv, aes_block_bytes);
+    ssize_t sent_bytes = sendmsg(operation_fd, &message, 0);
+    if (sent_bytes < 0) {
+      exit_with_system_error("sendmsg(AF_ALG)");
+    }
+    if (static_cast<size_t>(sent_bytes) != length) {
+      fprintf(stderr, "sendmsg(AF_ALG) took %zd of %zu bytes\n", sent_bytes, length);
+      exit(1);
+    }
+  }
+  int operation_socket() const { return operation_fd; }
+
+ private:
+  int transform_fd;
+  int operation_fd;
+};
+
+// The header of the AIO ring that io_setup maps into user memory (struct
+// aio_ring of the kernel fs/aio.c, which is not in the uapi headers). The
+// io_events follow the header. The kernel writes the event of each completion
+// at events()[tail], then moves tail on, and wraps at event_count.
+struct KernelAioRing {
+  unsigned id;
+  unsigned event_count;
+  unsigned head;
+  unsigned tail;
+  unsigned magic;
+  unsigned compat_features;
+  unsigned incompat_features;
+  unsigned header_length;
+  io_event *events() { return reinterpret_cast<io_event *>(this + 1); }
+};
+constexpr unsigned kernel_aio_ring_magic = 0xa10a10a1;
+
+// One AES-128-CBC decrypt at a time on a QAT device. The kernel binds the QAT
+// driver by its driver name, qat_aes_cbc: the AES-NI driver of cbc(aes) has a
+// higher priority. The ciphertext is made by ipp-crypto, so each output is
+// checked against code that is not the kernel's or the device's.
+class QatDecryptOffload {
+ public:
+  QatDecryptOffload(size_t offload_bytes, std::mt19937_64 &random)
+      : offload_bytes(offload_bytes),
+        plaintext(random_bytes(offload_bytes, random)),
+        ciphertext(encrypt_with_ipp_crypto(plaintext)),
+        output(offload_bytes),
+        qat_cipher("qat_aes_cbc", key, key_bytes) {
+    if (syscall(SYS_io_setup, 1, &aio_context) != 0) {
+      exit_with_system_error("io_setup");
+    }
+    ring = reinterpret_cast<KernelAioRing *>(aio_context);
+    if (ring->magic != kernel_aio_ring_magic || ring->header_length != sizeof(KernelAioRing)) {
+      fprintf(stderr, "the AIO ring of this kernel does not have the layout of fs/aio.c\n");
+      exit(1);
+    }
+    // One offload checks that the kernel writes the io_event where prepare()
+    // expects it.
+    volatile uint8_t *completion_byte = prepare();
+    submit();
+    bool output_correct = reap();
+    if (*completion_byte != 1) {
+      fprintf(stderr, "the kernel wrote the io_event to another slot of the AIO ring\n");
+      exit(1);
+    }
+    if (!output_correct) {
+      fprintf(stderr, "the QAT output is not the plaintext\n");
+      exit(1);
+    }
+  }
+  ~QatDecryptOffload() { syscall(SYS_io_destroy, aio_context); }
+  QatDecryptOffload(const QatDecryptOffload &) = delete;
+  QatDecryptOffload &operator=(const QatDecryptOffload &) = delete;
+
+  // Clears the output and the completion byte of the io_event that the next
+  // completion fills, and returns the completion byte. The completion sets it
+  // to 1 (aio_data).
+  volatile uint8_t *prepare() {
+    std::fill(output.begin(), output.end(), 0);
+    io_event &next_event = ring->events()[ring->tail];
+    next_event.data = 0;
+    return reinterpret_cast<volatile uint8_t *>(&next_event.data);
+  }
+  // sendmsg of the ciphertext, then io_submit of a read of the plaintext. The
+  // read starts the decrypt on the device and returns at once.
+  void submit() {
+    qat_cipher.send_request(ALG_OP_DECRYPT, iv, ciphertext.data(), offload_bytes);
+    iocb read_request = {};
+    read_request.aio_data = 1;
+    read_request.aio_lio_opcode = IOCB_CMD_PREAD;
+    read_request.aio_fildes = static_cast<uint32_t>(qat_cipher.operation_socket());
+    read_request.aio_buf = reinterpret_cast<uint64_t>(output.data());
+    read_request.aio_nbytes = offload_bytes;
+    iocb *read_requests[] = {&read_request};
+    if (syscall(SYS_io_submit, aio_context, 1, read_requests) != 1) {
+      exit_with_system_error("io_submit");
+    }
+  }
+  // Takes the io_event of the offload (waits at most 1 s) and returns true when
+  // the read is whole and the output is the plaintext.
+  bool reap() {
+    io_event event = {};
+    timespec timeout = {1, 0};
+    long event_count = syscall(SYS_io_getevents, aio_context, 1, 1, &event, &timeout);
+    if (event_count < 0) {
+      exit_with_system_error("io_getevents");
+    }
+    if (event_count == 0) {
+      fprintf(stderr, "the QAT offload did not complete in 1 s\n");
+      exit(1);
+    }
+    return event.res == static_cast<int64_t>(offload_bytes) && output == plaintext;
+  }
+
+ private:
+  static constexpr uint8_t key[] = "0123456789abcdef";
+  static constexpr size_t key_bytes = 16;
+  static constexpr uint8_t iv[] = "fedcba9876543210";
+
+  static std::vector<uint8_t> encrypt_with_ipp_crypto(const std::vector<uint8_t> &plaintext) {
+    int spec_size = 0;
+    check(ippsAESGetSize(&spec_size), "ippsAESGetSize");
+    std::vector<Ipp8u> spec_memory(spec_size);
+    IppsAESSpec *spec = reinterpret_cast<IppsAESSpec *>(spec_memory.data());
+    check(ippsAESInit(key, key_bytes, spec, spec_size), "ippsAESInit");
+    std::vector<uint8_t> ciphertext(plaintext.size());
+    check(ippsAESEncryptCBC(plaintext.data(), ciphertext.data(), static_cast<int>(plaintext.size()),
+                            spec, iv),
+          "ippsAESEncryptCBC");
+    return ciphertext;
+  }
+  static void check(IppStatus status, const char *function) {
+    if (status != ippStsNoErr) {
+      fprintf(stderr, "QAT offload: %s returned %d\n", function, status);
+      exit(1);
+    }
+  }
+
+  size_t offload_bytes;
+  std::vector<uint8_t> plaintext;
+  std::vector<uint8_t> ciphertext;
+  std::vector<uint8_t> output;
+  AfAlgSkcipher qat_cipher;
+  aio_context_t aio_context = 0;
+  KernelAioRing *ring = nullptr;
+};
+
+// A thread on its own CPU that records when a completion byte becomes
+// nonzero. The device gives no time stamp of its completion, so the time the
+// observer sees the byte stands for the completion time. The observer loads the
+// byte in a tight loop, as the filler CPU does in qat-floor mode.
+class CompletionObserver {
+ public:
+  explicit CompletionObserver(int cpu) : observer_thread([this, cpu] { observe(cpu); }) {}
+  ~CompletionObserver() {
+    stop_requested.store(true, std::memory_order_release);
+    observer_thread.join();
+  }
+  // Returns when the observer loads the byte. Call before the submit.
+  void watch(volatile uint8_t *completion_byte) {
+    watched_byte = completion_byte;
+    state.store(State::watch_requested, std::memory_order_release);
+    while (state.load(std::memory_order_acquire) != State::watching) {
+      _mm_pause();
+    }
+  }
+  // Waits until the observer sees the byte set, and returns the TSC it read
+  // then.
+  uint64_t wait_for_completion_tsc() {
+    while (state.load(std::memory_order_acquire) != State::completion_seen) {
+      _mm_pause();
+    }
+    state.store(State::idle, std::memory_order_relaxed);
+    return completion_seen_tsc;
+  }
+
+ private:
+  enum class State { idle, watch_requested, watching, completion_seen };
+
+  void observe(int cpu) {
+    pin_current_thread_to_cpu(cpu);
+    while (!stop_requested.load(std::memory_order_acquire)) {
+      if (state.load(std::memory_order_acquire) != State::watch_requested) {
+        _mm_pause();
+        continue;
+      }
+      volatile uint8_t *completion_byte = watched_byte;
+      state.store(State::watching, std::memory_order_release);
+      while (*completion_byte == 0) {
+      }
+      completion_seen_tsc = read_tsc();
+      state.store(State::completion_seen, std::memory_order_release);
+    }
+  }
+
+  volatile uint8_t *watched_byte = nullptr;  // written before watch_requested
+  uint64_t completion_seen_tsc = 0;          // written before completion_seen
+  std::atomic<State> state{State::idle};
+  std::atomic<bool> stop_requested{false};
+  std::thread observer_thread;  // Last, so that it starts after the atomics exist.
+};
+
+// The interrupts of the QAT devices that each CPU has handled, from
+// /proc/interrupts: the sum over the lines whose names hold "qat".
+static std::map<int, uint64_t> read_qat_interrupts_per_cpu() {
+  std::ifstream interrupts_file("/proc/interrupts");
+  std::string line;
+  std::getline(interrupts_file, line);
+  std::vector<int> column_cpus;  // the header names each column: CPU0 CPU1 ...
+  std::istringstream header(line);
+  std::string cpu_name;
+  while (header >> cpu_name) {
+    column_cpus.push_back(atoi(cpu_name.c_str() + strlen("CPU")));
+  }
+  std::map<int, uint64_t> interrupts_per_cpu;
+  while (std::getline(interrupts_file, line)) {
+    if (line.find("qat") == std::string::npos) {
+      continue;
+    }
+    std::istringstream fields(line);
+    std::string irq_label;
+    fields >> irq_label;
+    for (int cpu : column_cpus) {
+      uint64_t count = 0;
+      fields >> count;
+      interrupts_per_cpu[cpu] += count;
+    }
+  }
+  return interrupts_per_cpu;
+}
+
+struct QatInterrupts {
+  uint64_t total = 0;
+  int busiest_cpu = -1;  // the CPU that handled the most of them
+  uint64_t busiest_cpu_count = 0;
+};
+
+static QatInterrupts qat_interrupts_between(const std::map<int, uint64_t> &before,
+                                            const std::map<int, uint64_t> &after) {
+  QatInterrupts interrupts;
+  for (const auto &[cpu, count_after] : after) {
+    auto count_before = before.find(cpu);
+    uint64_t count = count_after - (count_before == before.end() ? 0 : count_before->second);
+    interrupts.total += count;
+    if (count > interrupts.busiest_cpu_count) {
+      interrupts.busiest_cpu = cpu;
+      interrupts.busiest_cpu_count = count;
+    }
+  }
+  return interrupts;
+}
+
+// ---------------------------------------------------------------------------
 // Filler fiber
 
 static void filler_fiber_entry(fcontext_transfer_t transfer) {
@@ -698,6 +1043,74 @@ static PreemptedRun run_filler_with_offload(Filler &filler, FillerFiber &fiber,
   return run;
 }
 
+struct QatPreemptedRun {
+  RunOutcome outcome;
+  // The time of the scheduler in sendmsg and io_submit.
+  int64_t submit_ticks;
+  // From the start of the submit to the observer seeing the completion byte:
+  // the copy into the kernel, the device, its interrupt and the kernel
+  // completion.
+  int64_t offload_ticks;
+  // From the observer seeing the completion byte to the filler stop. Can be
+  // negative for a yield: qat-floor measures the offset between the filler CPU
+  // and the observer CPU in seeing the byte.
+  int64_t detect_ticks;
+  // From the filler stop to the scheduler running again.
+  int64_t switch_ticks;
+  // The completion byte was set when io_submit returned. When this is so on
+  // each run, the kernel does the decrypt in the submit and not on the device
+  // in the background; on a few runs it only means that the submit was slow.
+  bool completed_during_submit;
+  bool output_correct;
+  bool offload_output_correct;
+};
+
+// run_filler_with_offload with a QAT offload in flight.
+static QatPreemptedRun run_filler_with_qat_offload(Filler &filler, FillerFiber &fiber,
+                                                   QatDecryptOffload &offload,
+                                                   CompletionObserver &observer,
+                                                   uint64_t reference_checksum) {
+  filler.reset();
+  volatile uint8_t *completion_byte = offload.prepare();
+  observer.watch(completion_byte);
+  filler_finished = false;
+  inside_filler_fiber = true;
+  preempt_signal = completion_byte;
+  uint64_t submit_start_tsc = read_tsc();
+  offload.submit();
+  uint64_t submit_end_tsc = read_tsc();
+  bool completed_during_submit = *completion_byte != 0;
+
+  fcontext_transfer_t from_filler = fcontext_swap(fiber.new_context(), &filler);
+  uint64_t scheduler_resumed_tsc = read_tsc();
+  preempt_signal = &signal_byte_never_set;
+  uint64_t stopped_tsc = filler_stopped_tsc;
+  bool yielded = !filler_finished;
+  if (yielded) {
+    fcontext_swap(from_filler.prev_context, nullptr);
+  }
+  inside_filler_fiber = false;
+  bool offload_output_correct = offload.reap();
+  uint64_t completion_seen_tsc = observer.wait_for_completion_tsc();
+
+  QatPreemptedRun run;
+  run.submit_ticks = static_cast<int64_t>(submit_end_tsc - submit_start_tsc);
+  run.offload_ticks = static_cast<int64_t>(completion_seen_tsc - submit_start_tsc);
+  run.detect_ticks = static_cast<int64_t>(stopped_tsc - completion_seen_tsc);
+  run.switch_ticks = static_cast<int64_t>(scheduler_resumed_tsc - stopped_tsc);
+  if (yielded) {
+    run.outcome = RunOutcome::yielded;
+  } else if (run.detect_ticks >= 0) {
+    run.outcome = RunOutcome::finished_after_completion;
+  } else {
+    run.outcome = RunOutcome::finished_before_completion;
+  }
+  run.completed_during_submit = completed_during_submit;
+  run.output_correct = filler.checksum() == reference_checksum;
+  run.offload_output_correct = offload_output_correct;
+  return run;
+}
+
 // ---------------------------------------------------------------------------
 // Measurements
 
@@ -708,6 +1121,9 @@ struct Options {
   int runs = 0;
   int cpu = 2;
   int accelerator_cpu = 4;
+  int observer_cpu = 6;
+  size_t offload_bytes = 4096;
+  double idle_us = 0;
   double offload_ns = 0;  // 0: the default of the mode
   uint64_t seed = 1;
   std::string samples_path;
@@ -878,23 +1294,167 @@ static void measure_signal_floor(const Options &options, const TscClock &clock,
          percentile(floors_ns, 1.0));
 }
 
+static void measure_qat_latency(const char *filler_name, Filler &filler, const Options &options,
+                                const TscClock &clock, QatDecryptOffload &offload,
+                                CompletionObserver &observer, FILE *samples) {
+  uint64_t reference_checksum = warm_up(filler);
+  int wrong_outputs = 0;
+  double filler_median_ns =
+      percentile(time_runs(filler, 20, reference_checksum, clock, wrong_outputs), 0.5);
+
+  FillerFiber fiber;
+  for (int run_index = 0; run_index < warmup_runs; run_index++) {
+    run_filler_with_qat_offload(filler, fiber, offload, observer, reference_checksum);
+  }
+  int run_counts[3] = {};
+  int failed_offloads = 0;
+  int completed_during_submit_count = 0;
+  std::vector<double> submits_ns;
+  std::vector<double> offloads_ns;
+  // Of the runs where the completion came before the filler stopped.
+  std::vector<double> latencies_ns;
+  std::vector<double> detects_ns;
+  std::vector<double> switches_ns;
+  std::map<int, uint64_t> interrupts_before = read_qat_interrupts_per_cpu();
+  for (int run_index = 0; run_index < options.runs; run_index++) {
+    QatPreemptedRun run =
+        run_filler_with_qat_offload(filler, fiber, offload, observer, reference_checksum);
+    run_counts[static_cast<int>(run.outcome)]++;
+    if (!run.output_correct) {
+      wrong_outputs++;
+    }
+    if (!run.offload_output_correct) {
+      failed_offloads++;
+    }
+    if (run.completed_during_submit) {
+      completed_during_submit_count++;
+    }
+    double submit_ns = clock.ticks_to_ns(static_cast<double>(run.submit_ticks));
+    double offload_ns = clock.ticks_to_ns(static_cast<double>(run.offload_ticks));
+    double detect_ns = clock.ticks_to_ns(static_cast<double>(run.detect_ticks));
+    double switch_ns = clock.ticks_to_ns(static_cast<double>(run.switch_ticks));
+    double latency_ns = detect_ns + switch_ns;
+    submits_ns.push_back(submit_ns);
+    offloads_ns.push_back(offload_ns);
+    if (run.outcome != RunOutcome::finished_before_completion) {
+      latencies_ns.push_back(latency_ns);
+      detects_ns.push_back(detect_ns);
+      switches_ns.push_back(switch_ns);
+    }
+    if (samples != nullptr) {
+      fprintf(samples, "%s,%s,%s,%zu,%zu,%d,%.0f,%.0f,%s,%.0f,%.0f,%.0f,%d,%d\n",
+              RACER_PROBE_INTERVAL, options.ipp_code_path.c_str(), filler_name, options.size_bytes,
+              options.offload_bytes, run_index, submit_ns, offload_ns, outcome_name(run.outcome),
+              detect_ns, switch_ns, latency_ns, run.output_correct ? 1 : 0,
+              run.offload_output_correct ? 1 : 0);
+    }
+  }
+  QatInterrupts interrupts =
+      qat_interrupts_between(interrupts_before, read_qat_interrupts_per_cpu());
+  printf("qat-latency,%s,%s,%s,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64,
+         RACER_PROBE_INTERVAL, options.ipp_code_path.c_str(), filler_name, options.size_bytes,
+         options.offload_bytes, options.runs, run_counts[static_cast<int>(RunOutcome::yielded)],
+         run_counts[static_cast<int>(RunOutcome::finished_after_completion)],
+         run_counts[static_cast<int>(RunOutcome::finished_before_completion)], wrong_outputs,
+         failed_offloads, completed_during_submit_count, interrupts.total, interrupts.busiest_cpu,
+         interrupts.busiest_cpu_count);
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(submits_ns, 0.5), percentile(submits_ns, 0.99),
+         percentile(offloads_ns, 0.5), percentile(offloads_ns, 0.99));
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(latencies_ns, 0.5), percentile(latencies_ns, 0.9),
+         percentile(latencies_ns, 0.99), percentile(latencies_ns, 1.0));
+  printf(",%.0f,%.0f,%.0f", percentile(detects_ns, 0.5), percentile(detects_ns, 0.9),
+         percentile(detects_ns, 0.99));
+  printf(",%.0f,%.0f,%.0f", percentile(switches_ns, 0.5), percentile(switches_ns, 0.9),
+         percentile(switches_ns, 0.99));
+  printf(",%.0f\n", filler_median_ns);
+}
+
+// The least detect time of qat-latency. With no filler and no fiber, the filler
+// CPU loads the completion byte in a tight loop, as the observer does. The time
+// from the observer seeing the byte to the filler CPU seeing it is the offset
+// between the two CPUs: the difference of their cache-line transfers from the
+// CPU of the interrupt, plus any TSC offset. Before each offload, the device
+// is idle for --idle-us: the offload time depends on how long the device was
+// idle.
+static void measure_qat_floor(const Options &options, const TscClock &clock,
+                              QatDecryptOffload &offload, CompletionObserver &observer) {
+  std::vector<double> submits_ns;
+  std::vector<double> offloads_ns;
+  std::vector<double> floors_ns;
+  int failed_offloads = 0;
+  int completed_during_submit_count = 0;
+  uint64_t idle_ticks = static_cast<uint64_t>(clock.ns_to_ticks(options.idle_us * 1000));
+  std::map<int, uint64_t> interrupts_before;
+  for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
+    if (run_index == warmup_runs) {
+      interrupts_before = read_qat_interrupts_per_cpu();
+    }
+    volatile uint8_t *completion_byte = offload.prepare();
+    observer.watch(completion_byte);
+    uint64_t idle_start_tsc = read_tsc();
+    while (read_tsc() - idle_start_tsc < idle_ticks) {
+    }
+    uint64_t submit_start_tsc = read_tsc();
+    offload.submit();
+    uint64_t submit_end_tsc = read_tsc();
+    bool completed_during_submit = *completion_byte != 0;
+    while (*completion_byte == 0) {
+    }
+    uint64_t seen_tsc = read_tsc();
+    bool offload_output_correct = offload.reap();
+    uint64_t completion_seen_tsc = observer.wait_for_completion_tsc();
+    if (run_index < warmup_runs) {
+      continue;
+    }
+    if (!offload_output_correct) {
+      failed_offloads++;
+    }
+    if (completed_during_submit) {
+      completed_during_submit_count++;
+    }
+    submits_ns.push_back(clock.ticks_to_ns(static_cast<double>(submit_end_tsc - submit_start_tsc)));
+    offloads_ns.push_back(clock.ticks_to_ns(
+        static_cast<double>(static_cast<int64_t>(completion_seen_tsc - submit_start_tsc))));
+    floors_ns.push_back(clock.ticks_to_ns(
+        static_cast<double>(static_cast<int64_t>(seen_tsc - completion_seen_tsc))));
+  }
+  QatInterrupts interrupts =
+      qat_interrupts_between(interrupts_before, read_qat_interrupts_per_cpu());
+  printf("qat-floor,%d,%d,%zu,%g,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64, options.cpu,
+         options.observer_cpu, options.offload_bytes, options.idle_us, options.runs,
+         failed_offloads,
+         completed_during_submit_count, interrupts.total, interrupts.busiest_cpu,
+         interrupts.busiest_cpu_count);
+  printf(",%.0f,%.0f", percentile(submits_ns, 0.5), percentile(submits_ns, 0.99));
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(offloads_ns, 0.5), percentile(offloads_ns, 0.1),
+         percentile(offloads_ns, 0.9), percentile(offloads_ns, 0.99));
+  printf(",%.0f,%.0f,%.0f,%.0f\n", percentile(floors_ns, 0.5), percentile(floors_ns, 0.1),
+         percentile(floors_ns, 0.9), percentile(floors_ns, 0.99));
+}
+
 // ---------------------------------------------------------------------------
 // Command line
 
 static void print_usage(FILE *stream) {
   fprintf(stream,
-          "usage: preempt_bench --mode overhead|latency|signal-floor [options]\n"
+          "usage: preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor\n"
+          "                     [options]\n"
           "  --filler NAME        a filler, or all (default); repeat for more than one\n"
           "  --size BYTES         input size of each filler, a multiple of 64 (default 65536)\n"
-          "  --runs N             measured runs (default 2000 overhead, 1000 latency,\n"
-          "                       10000 signal-floor)\n"
+          "  --runs N             measured runs (default 2000 overhead, 1000 latency and\n"
+          "                       qat-latency, 10000 signal-floor and qat-floor)\n"
           "  --cpu N              CPU of the filler (default 2)\n"
           "  --accelerator-cpu N  CPU of the emulated accelerator (default 4)\n"
+          "  --observer-cpu N     qat modes: CPU of the completion observer (default 6)\n"
+          "  --offload-bytes N    qat modes: bytes of each QAT decrypt, a multiple of 16,\n"
+          "                       at most 65536 (default 4096)\n"
+          "  --idle-us N          qat-floor mode: the device is idle for N us before each\n"
+          "                       offload (default 0)\n"
           "  --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]\n"
           "                       in latency mode, 1000 in signal-floor mode\n"
           "  --seed N             seed of the inputs and the offload times of each filler\n"
           "                       (default 1)\n"
-          "  --samples PATH       latency mode: also write each run to PATH\n"
+          "  --samples PATH       latency and qat-latency modes: also write each run to PATH\n"
           "  --ipp-code-path P    GCM code of ipp-crypto: native (default; VAES assembly on\n"
           "                       AVX-512 CPUs), aesni (AES-NI assembly), or portable-c\n"
           "                       (table C code, which has probe points in its block loop)\n"
@@ -923,6 +1483,9 @@ static Options parse_options(int argc, char **argv) {
     runs_option,
     cpu_option,
     accelerator_cpu_option,
+    observer_cpu_option,
+    offload_bytes_option,
+    idle_us_option,
     offload_ns_option,
     seed_option,
     samples_option,
@@ -937,6 +1500,9 @@ static Options parse_options(int argc, char **argv) {
       {"runs", required_argument, nullptr, runs_option},
       {"cpu", required_argument, nullptr, cpu_option},
       {"accelerator-cpu", required_argument, nullptr, accelerator_cpu_option},
+      {"observer-cpu", required_argument, nullptr, observer_cpu_option},
+      {"offload-bytes", required_argument, nullptr, offload_bytes_option},
+      {"idle-us", required_argument, nullptr, idle_us_option},
       {"offload-ns", required_argument, nullptr, offload_ns_option},
       {"seed", required_argument, nullptr, seed_option},
       {"samples", required_argument, nullptr, samples_option},
@@ -966,6 +1532,15 @@ static Options parse_options(int argc, char **argv) {
       case accelerator_cpu_option:
         options.accelerator_cpu = atoi(optarg);
         break;
+      case observer_cpu_option:
+        options.observer_cpu = atoi(optarg);
+        break;
+      case offload_bytes_option:
+        options.offload_bytes = strtoull(optarg, nullptr, 0);
+        break;
+      case idle_us_option:
+        options.idle_us = atof(optarg);
+        break;
       case offload_ns_option:
         options.offload_ns = atof(optarg);
         break;
@@ -989,12 +1564,19 @@ static Options parse_options(int argc, char **argv) {
         exit(2);
     }
   }
-  if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor") {
+  if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor" &&
+      options.mode != "qat-latency" && options.mode != "qat-floor") {
     print_usage(stderr);
     exit(2);
   }
   if (options.size_bytes == 0 || options.size_bytes % 64 != 0 || options.size_bytes > (1u << 30)) {
     fprintf(stderr, "--size must be a nonzero multiple of 64, at most 1 GiB\n");
+    exit(2);
+  }
+  // AF_ALG takes at most the socket send buffer (about 212 KB) in one sendmsg.
+  if (options.offload_bytes == 0 || options.offload_bytes % aes_block_bytes != 0 ||
+      options.offload_bytes > 65536) {
+    fprintf(stderr, "--offload-bytes must be a nonzero multiple of 16, at most 65536\n");
     exit(2);
   }
   if (options.ipp_code_path != "native" && options.ipp_code_path != "aesni" &&
@@ -1005,7 +1587,7 @@ static Options parse_options(int argc, char **argv) {
   if (options.runs <= 0) {
     if (options.mode == "overhead") {
       options.runs = 2000;
-    } else if (options.mode == "latency") {
+    } else if (options.mode == "latency" || options.mode == "qat-latency") {
       options.runs = 1000;
     } else {
       options.runs = 10000;
@@ -1054,6 +1636,20 @@ static void select_ipp_code_path(const std::string &ipp_code_path) {
   }
 }
 
+// Opens the samples file and writes its header; nullptr when path is empty.
+static FILE *open_samples_file(const std::string &path, const char *header) {
+  if (path.empty()) {
+    return nullptr;
+  }
+  FILE *samples = fopen(path.c_str(), "w");
+  if (samples == nullptr) {
+    fprintf(stderr, "cannot write %s: %s\n", path.c_str(), strerror(errno));
+    exit(1);
+  }
+  fprintf(samples, "%s\n", header);
+  return samples;
+}
+
 int main(int argc, char **argv) {
   Options options = parse_options(argc, argv);
   select_ipp_code_path(options.ipp_code_path);
@@ -1086,17 +1682,61 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  FILE *samples = nullptr;
-  if (!options.samples_path.empty()) {
-    samples = fopen(options.samples_path.c_str(), "w");
-    if (samples == nullptr) {
-      fprintf(stderr, "cannot write %s: %s\n", options.samples_path.c_str(), strerror(errno));
-      return 1;
+  // The QAT instance of the kernel driver is on the NUMA node of the CPU that
+  // makes the transform: the filler CPU, pinned above.
+  if (options.mode == "qat-floor") {
+    if (options.print_header) {
+      printf(
+          "mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,"
+          "qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
+          "submit_median_ns,submit_p99_ns,"
+          "offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,"
+          "floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns\n");
     }
-    fprintf(samples,
-            "probe_interval,ipp_code_path,filler,size_bytes,run,offload_ns,"
-            "accelerator_lateness_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct\n");
+    std::mt19937_64 offload_random(options.seed);
+    QatDecryptOffload offload(options.offload_bytes, offload_random);
+    CompletionObserver observer(options.observer_cpu);
+    measure_qat_floor(options, clock, offload, observer);
+    return 0;
   }
+
+  if (options.mode == "qat-latency") {
+    FILE *samples = open_samples_file(
+        options.samples_path,
+        "probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,"
+        "outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct");
+    if (options.print_header) {
+      printf(
+          "mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,"
+          "yielded,finished_after_completion,finished_before_completion,"
+          "wrong_outputs,failed_offloads,completed_during_submit,"
+          "qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
+          "submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,"
+          "latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,"
+          "detect_median_ns,detect_p90_ns,detect_p99_ns,"
+          "switch_median_ns,switch_p90_ns,switch_p99_ns,"
+          "filler_median_ns\n");
+    }
+    std::mt19937_64 offload_random(options.seed);
+    QatDecryptOffload offload(options.offload_bytes, offload_random);
+    CompletionObserver observer(options.observer_cpu);
+    for (const std::string &name : options.filler_names) {
+      std::mt19937_64 input_random(options.seed);
+      std::unique_ptr<Filler> filler =
+          find_filler_kind(name)->make(options.size_bytes, input_random);
+      measure_qat_latency(name.c_str(), *filler, options, clock, offload, observer, samples);
+      fflush(stdout);
+    }
+    if (samples != nullptr) {
+      fclose(samples);
+    }
+    return 0;
+  }
+
+  FILE *samples = open_samples_file(
+      options.samples_path,
+      "probe_interval,ipp_code_path,filler,size_bytes,run,offload_ns,"
+      "accelerator_lateness_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct");
   if (options.print_header) {
     printf(
         "mode,probe_interval,ipp_code_path,filler,size_bytes,runs,"
