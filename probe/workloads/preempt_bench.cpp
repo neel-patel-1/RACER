@@ -11,13 +11,18 @@
 //                   do_yield in RACER's src/baseline.cpp does
 //
 // Modes:
-//   overhead  runs each filler with no offload in flight and reports its
-//             runtime. Compare a build with probes to the off build.
-//   latency   submits an offload to the emulated accelerator, runs the filler
-//             in a fiber, and measures the time from the accelerator
-//             completion to the scheduler getting the core back (a yield at a
-//             probe point, or the end of the filler). Then it resumes the
-//             filler to its end and checks its output.
+//   overhead      runs each filler with no offload in flight and reports its
+//                 runtime, and counts the probe points one run executes.
+//                 Compare a build with probes to the off build.
+//   latency       submits an offload to the emulated accelerator, runs the
+//                 filler in a fiber, and measures the time from the
+//                 accelerator completion to the scheduler running again, in
+//                 two parts: detect (to the probe point that sees the
+//                 completion, or the end of the filler) and switch (from the
+//                 filler fiber to the scheduler). Then it resumes the filler to
+//                 its end and checks its output.
+//   signal-floor  measures the least detect time: the filler CPU loads the
+//                 status byte in a tight loop, with no filler and no fiber.
 #include <getopt.h>
 #include <pthread.h>
 #include <sched.h>
@@ -56,13 +61,21 @@ extern "C" {
 // preempt_signal points here whenever no offload is in flight, so that probe
 // points outside a filler (protobuf calls in the setup code) never yield.
 static uint8_t signal_byte_never_set = 0;
+// preempt_signal points here while count_probe_executions runs a filler, so
+// that each probe point the filler executes calls do_yield.
+static uint8_t signal_byte_always_set = 1;
 __thread volatile uint8_t *preempt_signal = &signal_byte_never_set;
 
 static thread_local fcontext_transfer_t scheduler_transfer;
 static thread_local bool inside_filler_fiber = false;
 static thread_local bool filler_finished = false;
-// The time the filler last gave the core back: at a yield or at its end.
-static thread_local uint64_t scheduler_return_tsc = 0;
+// The time the filler last stopped: at the entry of do_yield, or at the end of
+// the filler.
+static thread_local uint64_t filler_stopped_tsc = 0;
+// While true, do_yield counts the call in probe_executions and returns with no
+// switch.
+static thread_local bool counting_probe_executions = false;
+static thread_local uint64_t probe_executions = 0;
 
 static inline uint64_t read_tsc() {
   _mm_lfence();
@@ -73,11 +86,15 @@ static inline uint64_t read_tsc() {
 
 extern "C" void do_yield(void) {
   uint64_t yield_tsc = read_tsc();
+  if (counting_probe_executions) {
+    probe_executions++;
+    return;
+  }
   if (!inside_filler_fiber) {
     fprintf(stderr, "do_yield outside a filler fiber: preempt_signal points at a set byte\n");
     abort();
   }
-  scheduler_return_tsc = yield_tsc;
+  filler_stopped_tsc = yield_tsc;
   scheduler_transfer = fcontext_swap(scheduler_transfer.prev_context, nullptr);
 }
 
@@ -467,9 +484,32 @@ static const FillerKind filler_kinds[] = {
 
 // The completion record of an offload. As in the IAA and DSA completion
 // records, its first byte is the status the device writes when it is done.
-struct alignas(64) CompletionRecord {
-  volatile uint8_t status;
-  uint64_t completion_tsc;
+struct CompletionRecord {
+  alignas(64) volatile uint8_t status;
+  // The time of the completion, in its own cache line: a device writes its
+  // record in one write, so the status write must be the only write to the
+  // line that the probe points load.
+  alignas(64) uint64_t completion_tsc;
+};
+
+// The completion records that the runs take in turn. The time for the status
+// write to reach the filler CPU depends on the L3 slice that is home to the
+// cache line, and the physical address selects that slice. With one record,
+// the latency of one process differs from that of the next by up to 50 ns
+// (emerald-02). Records on many pages put the runs of a process on many
+// slices.
+class CompletionRecordPool {
+ public:
+  CompletionRecord &next() {
+    CompletionRecord &record = records[next_index];
+    next_index = (next_index + 1) % records.size();
+    return record;
+  }
+
+ private:
+  static constexpr size_t record_count = 1024;  // 128 KiB, 32 pages
+  std::vector<CompletionRecord> records = std::vector<CompletionRecord>(record_count);
+  size_t next_index = 0;
 };
 
 // A thread on its own CPU that plays the accelerator. It takes one offload at
@@ -482,8 +522,8 @@ class EmulatedAccelerator {
     stop_requested.store(true, std::memory_order_release);
     device_thread.join();
   }
-  void submit(CompletionRecord *record, uint64_t completion_tsc) {
-    pending_completion_tsc.store(completion_tsc, std::memory_order_relaxed);
+  void submit(CompletionRecord *record, uint64_t requested_completion_tsc) {
+    pending_requested_completion_tsc.store(requested_completion_tsc, std::memory_order_relaxed);
     pending_record.store(record, std::memory_order_release);
   }
   void wait_until_idle() const {
@@ -501,18 +541,21 @@ class EmulatedAccelerator {
         _mm_pause();
         continue;
       }
-      uint64_t completion_tsc = pending_completion_tsc.load(std::memory_order_relaxed);
-      while (read_tsc() < completion_tsc) {
+      uint64_t requested_completion_tsc =
+          pending_requested_completion_tsc.load(std::memory_order_relaxed);
+      while (read_tsc() < requested_completion_tsc) {
         _mm_pause();
       }
-      record->completion_tsc = read_tsc();
+      uint64_t completion_tsc = read_tsc();
       __atomic_store_n(&record->status, 1, __ATOMIC_RELEASE);
+      record->completion_tsc = completion_tsc;
+      // The scheduler reads completion_tsc after wait_until_idle sees this.
       pending_record.store(nullptr, std::memory_order_release);
     }
   }
 
   std::atomic<CompletionRecord *> pending_record{nullptr};
-  std::atomic<uint64_t> pending_completion_tsc{0};
+  std::atomic<uint64_t> pending_requested_completion_tsc{0};
   std::atomic<bool> stop_requested{false};
   std::thread device_thread;  // Last, so that it starts after the atomics exist.
 };
@@ -524,7 +567,7 @@ static void filler_fiber_entry(fcontext_transfer_t transfer) {
   scheduler_transfer = transfer;
   Filler *filler = static_cast<Filler *>(transfer.data);
   filler->run();
-  scheduler_return_tsc = read_tsc();
+  filler_stopped_tsc = read_tsc();
   filler_finished = true;
   fcontext_swap(scheduler_transfer.prev_context, nullptr);
   // The scheduler never swaps back to a finished filler.
@@ -567,9 +610,13 @@ static const char *outcome_name(RunOutcome outcome) {
 
 struct PreemptedRun {
   RunOutcome outcome;
-  // From the completion to the scheduler getting the core back. Negative for
+  // From the completion to the filler stop: the entry of do_yield at the probe
+  // point that saw the completion, or the end of the filler. Negative for
   // finished_before_completion.
-  int64_t latency_ticks;
+  int64_t detect_ticks;
+  // From the filler stop to the scheduler running again: the switch from the
+  // filler fiber to the scheduler.
+  int64_t switch_ticks;
   // From the completion time asked for to the completion. Large when the OS
   // takes the accelerator CPU away: the run then does not show the probes.
   int64_t accelerator_lateness_ticks;
@@ -592,8 +639,9 @@ static PreemptedRun run_filler_with_offload(Filler &filler, FillerFiber &fiber,
   accelerator.submit(&record, requested_completion_tsc);
 
   fcontext_transfer_t from_filler = fcontext_swap(fiber.new_context(), &filler);
+  uint64_t scheduler_resumed_tsc = read_tsc();
   preempt_signal = &signal_byte_never_set;
-  uint64_t return_tsc = scheduler_return_tsc;
+  uint64_t stopped_tsc = filler_stopped_tsc;
   bool yielded = !filler_finished;
   if (yielded) {
     fcontext_swap(from_filler.prev_context, nullptr);
@@ -602,12 +650,13 @@ static PreemptedRun run_filler_with_offload(Filler &filler, FillerFiber &fiber,
   accelerator.wait_until_idle();
 
   PreemptedRun run;
-  run.latency_ticks = static_cast<int64_t>(return_tsc - record.completion_tsc);
+  run.detect_ticks = static_cast<int64_t>(stopped_tsc - record.completion_tsc);
+  run.switch_ticks = static_cast<int64_t>(scheduler_resumed_tsc - stopped_tsc);
   run.accelerator_lateness_ticks =
       static_cast<int64_t>(record.completion_tsc - requested_completion_tsc);
   if (yielded) {
     run.outcome = RunOutcome::yielded;
-  } else if (run.latency_ticks >= 0) {
+  } else if (run.detect_ticks >= 0) {
     run.outcome = RunOutcome::finished_after_completion;
   } else {
     run.outcome = RunOutcome::finished_before_completion;
@@ -626,7 +675,7 @@ struct Options {
   int runs = 0;
   int cpu = 2;
   int accelerator_cpu = 4;
-  double offload_ns = 0;  // 0: uniform in [0, 0.9 x median filler runtime]
+  double offload_ns = 0;  // 0: the default of the mode
   uint64_t seed = 1;
   std::string samples_path;
   std::string ipp_code_path = "native";
@@ -637,6 +686,7 @@ constexpr int warmup_runs = 5;
 // A completion this much later than asked for counts as late: the OS took the
 // accelerator CPU away. Use idle CPUs when the late count is not near 0.
 constexpr double late_completion_ns = 1000;
+constexpr double signal_floor_default_offload_ns = 1000;
 
 // Runs the filler warmup_runs times on the calling thread, with no offload.
 // Returns the checksum of the last run: the reference output.
@@ -665,16 +715,37 @@ static std::vector<double> time_runs(Filler &filler, int runs, uint64_t referenc
   return runtimes_ns;
 }
 
+// Runs the filler once with preempt_signal at a set byte and do_yield counting
+// instead of switching, and returns the number of probe points the run
+// executes. A probe point is one check at a loop header, so a run with the
+// signal clear executes the same number. Not timed.
+static uint64_t count_probe_executions(Filler &filler, uint64_t reference_checksum,
+                                       int &wrong_outputs) {
+  filler.reset();
+  probe_executions = 0;
+  counting_probe_executions = true;
+  preempt_signal = &signal_byte_always_set;
+  filler.run();
+  preempt_signal = &signal_byte_never_set;
+  counting_probe_executions = false;
+  if (filler.checksum() != reference_checksum) {
+    wrong_outputs++;
+  }
+  return probe_executions;
+}
+
 static void measure_overhead(const char *filler_name, Filler &filler, const Options &options,
                              const TscClock &clock) {
   uint64_t reference_checksum = warm_up(filler);
   int wrong_outputs = 0;
   std::vector<double> runtimes_ns =
       time_runs(filler, options.runs, reference_checksum, clock, wrong_outputs);
-  printf("overhead,%s,%s,%s,%zu,%d,%d,%.0f,%.0f,%.0f,%016" PRIx64 "\n", RACER_PROBE_INTERVAL,
-         options.ipp_code_path.c_str(), filler_name, options.size_bytes, options.runs,
-         wrong_outputs, percentile(runtimes_ns, 0.5), percentile(runtimes_ns, 0.1),
-         percentile(runtimes_ns, 0.9), reference_checksum);
+  uint64_t probe_executions_per_run =
+      count_probe_executions(filler, reference_checksum, wrong_outputs);
+  printf("overhead,%s,%s,%s,%zu,%d,%d,%.0f,%.0f,%.0f,%" PRIu64 ",%016" PRIx64 "\n",
+         RACER_PROBE_INTERVAL, options.ipp_code_path.c_str(), filler_name, options.size_bytes,
+         options.runs, wrong_outputs, percentile(runtimes_ns, 0.5), percentile(runtimes_ns, 0.1),
+         percentile(runtimes_ns, 0.9), probe_executions_per_run, reference_checksum);
 }
 
 static void measure_latency(const char *filler_name, Filler &filler, const Options &options,
@@ -687,42 +758,91 @@ static void measure_latency(const char *filler_name, Filler &filler, const Optio
   std::uniform_real_distribution<double> uniform_offload_ns(0, 0.9 * filler_median_ns);
 
   FillerFiber fiber;
-  CompletionRecord record = {};
+  CompletionRecordPool records;
   int run_counts[3] = {};
+  // Of the runs where the completion came before the filler stopped.
   std::vector<double> latencies_ns;
+  std::vector<double> detects_ns;
+  std::vector<double> switches_ns;
   int late_completions = 0;
   for (int run_index = 0; run_index < options.runs; run_index++) {
     double offload_ns =
         options.offload_ns > 0 ? options.offload_ns : uniform_offload_ns(offload_random);
-    PreemptedRun run = run_filler_with_offload(filler, fiber, accelerator, record,
+    PreemptedRun run = run_filler_with_offload(filler, fiber, accelerator, records.next(),
                                                clock.ns_to_ticks(offload_ns), reference_checksum);
     run_counts[static_cast<int>(run.outcome)]++;
     if (!run.output_correct) {
       wrong_outputs++;
     }
-    double latency_ns = clock.ticks_to_ns(static_cast<double>(run.latency_ticks));
+    double detect_ns = clock.ticks_to_ns(static_cast<double>(run.detect_ticks));
+    double switch_ns = clock.ticks_to_ns(static_cast<double>(run.switch_ticks));
+    double latency_ns = detect_ns + switch_ns;
     double lateness_ns = clock.ticks_to_ns(static_cast<double>(run.accelerator_lateness_ticks));
     if (lateness_ns > late_completion_ns) {
       late_completions++;
     }
     if (run.outcome != RunOutcome::finished_before_completion) {
       latencies_ns.push_back(latency_ns);
+      detects_ns.push_back(detect_ns);
+      switches_ns.push_back(switch_ns);
     }
     if (samples != nullptr) {
-      fprintf(samples, "%s,%s,%s,%zu,%d,%.0f,%.0f,%s,%.0f,%d\n", RACER_PROBE_INTERVAL,
+      fprintf(samples, "%s,%s,%s,%zu,%d,%.0f,%.0f,%s,%.0f,%.0f,%.0f,%d\n", RACER_PROBE_INTERVAL,
               options.ipp_code_path.c_str(), filler_name, options.size_bytes, run_index, offload_ns,
-              lateness_ns, outcome_name(run.outcome), latency_ns, run.output_correct ? 1 : 0);
+              lateness_ns, outcome_name(run.outcome), detect_ns, switch_ns, latency_ns,
+              run.output_correct ? 1 : 0);
     }
   }
-  printf("latency,%s,%s,%s,%zu,%d,%d,%d,%d,%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f\n", RACER_PROBE_INTERVAL,
+  printf("latency,%s,%s,%s,%zu,%d,%d,%d,%d,%d,%d", RACER_PROBE_INTERVAL,
          options.ipp_code_path.c_str(), filler_name, options.size_bytes, options.runs,
          run_counts[static_cast<int>(RunOutcome::yielded)],
          run_counts[static_cast<int>(RunOutcome::finished_after_completion)],
          run_counts[static_cast<int>(RunOutcome::finished_before_completion)], late_completions,
-         wrong_outputs, percentile(latencies_ns, 0.5), percentile(latencies_ns, 0.9),
-         percentile(latencies_ns, 0.99),
-         latencies_ns.empty() ? NAN : *std::max_element(latencies_ns.begin(), latencies_ns.end()),
-         filler_median_ns);
+         wrong_outputs);
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(latencies_ns, 0.5), percentile(latencies_ns, 0.9),
+         percentile(latencies_ns, 0.99), percentile(latencies_ns, 1.0));
+  printf(",%.0f,%.0f,%.0f", percentile(detects_ns, 0.5), percentile(detects_ns, 0.9),
+         percentile(detects_ns, 0.99));
+  printf(",%.0f,%.0f,%.0f", percentile(switches_ns, 0.5), percentile(switches_ns, 0.9),
+         percentile(switches_ns, 0.99));
+  printf(",%.0f\n", filler_median_ns);
+}
+
+// The least detect time. With no filler and no fiber, the filler CPU loads the
+// status byte in a tight loop until it sees the completion. The time from the
+// completion to that load is the time for the status write to reach the filler
+// CPU, plus a TSC read and any TSC offset between the two CPUs.
+static void measure_signal_floor(const Options &options, const TscClock &clock,
+                                 EmulatedAccelerator &accelerator) {
+  double offload_ns = options.offload_ns > 0 ? options.offload_ns : signal_floor_default_offload_ns;
+  CompletionRecordPool records;
+  std::vector<double> floors_ns;
+  int late_completions = 0;
+  for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
+    CompletionRecord &record = records.next();
+    record.status = 0;
+    record.completion_tsc = 0;
+    uint64_t requested_completion_tsc = read_tsc() + clock.ns_to_ticks(offload_ns);
+    accelerator.submit(&record, requested_completion_tsc);
+    while (record.status == 0) {
+    }
+    uint64_t seen_tsc = read_tsc();
+    accelerator.wait_until_idle();
+    if (run_index < warmup_runs) {
+      continue;
+    }
+    floors_ns.push_back(clock.ticks_to_ns(
+        static_cast<double>(static_cast<int64_t>(seen_tsc - record.completion_tsc))));
+    double lateness_ns = clock.ticks_to_ns(static_cast<double>(
+        static_cast<int64_t>(record.completion_tsc - requested_completion_tsc)));
+    if (lateness_ns > late_completion_ns) {
+      late_completions++;
+    }
+  }
+  printf("signal-floor,%d,%d,%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f\n", options.cpu,
+         options.accelerator_cpu, options.runs, late_completions, percentile(floors_ns, 0.5),
+         percentile(floors_ns, 0.1), percentile(floors_ns, 0.9), percentile(floors_ns, 0.99),
+         percentile(floors_ns, 1.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -730,13 +850,15 @@ static void measure_latency(const char *filler_name, Filler &filler, const Optio
 
 static void print_usage(FILE *stream) {
   fprintf(stream,
-          "usage: preempt_bench --mode overhead|latency [options]\n"
+          "usage: preempt_bench --mode overhead|latency|signal-floor [options]\n"
           "  --filler NAME        a filler, or all (default); repeat for more than one\n"
           "  --size BYTES         input size of each filler, a multiple of 64 (default 65536)\n"
-          "  --runs N             measured runs (default 200 overhead, 1000 latency)\n"
+          "  --runs N             measured runs (default 2000 overhead, 1000 latency,\n"
+          "                       10000 signal-floor)\n"
           "  --cpu N              CPU of the filler (default 2)\n"
           "  --accelerator-cpu N  CPU of the emulated accelerator (default 4)\n"
           "  --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]\n"
+          "                       in latency mode, 1000 in signal-floor mode\n"
           "  --seed N             seed of the inputs and the offload times of each filler\n"
           "                       (default 1)\n"
           "  --samples PATH       latency mode: also write each run to PATH\n"
@@ -834,7 +956,7 @@ static Options parse_options(int argc, char **argv) {
         exit(2);
     }
   }
-  if (options.mode != "overhead" && options.mode != "latency") {
+  if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor") {
     print_usage(stderr);
     exit(2);
   }
@@ -848,7 +970,13 @@ static Options parse_options(int argc, char **argv) {
     exit(2);
   }
   if (options.runs <= 0) {
-    options.runs = options.mode == "overhead" ? 200 : 1000;
+    if (options.mode == "overhead") {
+      options.runs = 2000;
+    } else if (options.mode == "latency") {
+      options.runs = 1000;
+    } else {
+      options.runs = 10000;
+    }
   }
   if (options.filler_names.empty() ||
       std::find(options.filler_names.begin(), options.filler_names.end(), "all") !=
@@ -903,7 +1031,7 @@ int main(int argc, char **argv) {
     if (options.print_header) {
       printf(
           "mode,probe_interval,ipp_code_path,filler,size_bytes,runs,wrong_outputs,"
-          "median_ns,p10_ns,p90_ns,checksum\n");
+          "median_ns,p10_ns,p90_ns,probe_executions_per_run,checksum\n");
     }
     for (const std::string &name : options.filler_names) {
       std::mt19937_64 input_random(options.seed);
@@ -915,6 +1043,16 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (options.mode == "signal-floor") {
+    if (options.print_header) {
+      printf(
+          "mode,cpu,accelerator_cpu,runs,late_completions,median_ns,p10_ns,p90_ns,p99_ns,max_ns\n");
+    }
+    EmulatedAccelerator accelerator(options.accelerator_cpu);
+    measure_signal_floor(options, clock, accelerator);
+    return 0;
+  }
+
   FILE *samples = nullptr;
   if (!options.samples_path.empty()) {
     samples = fopen(options.samples_path.c_str(), "w");
@@ -923,17 +1061,18 @@ int main(int argc, char **argv) {
       return 1;
     }
     fprintf(samples,
-            "probe_interval,ipp_code_path,filler,size_bytes,run,offload_ns,accelerator_lateness_ns,"
-            "outcome,latency_ns,"
-            "output_correct\n");
+            "probe_interval,ipp_code_path,filler,size_bytes,run,offload_ns,"
+            "accelerator_lateness_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct\n");
   }
   if (options.print_header) {
     printf(
-        "mode,probe_interval,ipp_code_path,filler,size_bytes,runs,yielded,finished_after_"
-        "completion,"
-        "finished_before_completion,late_completions,wrong_outputs,latency_median_ns,latency_p90_"
-        "ns,"
-        "latency_p99_ns,latency_max_ns,filler_median_ns\n");
+        "mode,probe_interval,ipp_code_path,filler,size_bytes,runs,"
+        "yielded,finished_after_completion,finished_before_completion,"
+        "late_completions,wrong_outputs,"
+        "latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,"
+        "detect_median_ns,detect_p90_ns,detect_p99_ns,"
+        "switch_median_ns,switch_p90_ns,switch_p99_ns,"
+        "filler_median_ns\n");
   }
   EmulatedAccelerator accelerator(options.accelerator_cpu);
   for (const std::string &name : options.filler_names) {
