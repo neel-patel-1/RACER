@@ -31,6 +31,10 @@
 //                 gives the completion time.
 //   qat-floor     the least detect time of qat-latency: the filler CPU loads
 //                 the completion byte in a tight loop. Also the offload time.
+//   qat-interrupt the kernel time of the QAT completion, with the filler on
+//                 the CPU of the QAT interrupt: the filler CPU loads the
+//                 completion byte and reads the TSC in a tight loop, and a
+//                 long step between two TSC reads is the interrupt.
 #include <getopt.h>
 #include <linux/aio_abi.h>
 #include <linux/if_alg.h>
@@ -1136,6 +1140,10 @@ constexpr int warmup_runs = 5;
 // accelerator CPU away. Use idle CPUs when the late count is not near 0.
 constexpr double late_completion_ns = 1000;
 constexpr double signal_floor_default_offload_ns = 1000;
+// In the spin loop of qat-interrupt, a step between two TSC reads longer than
+// this is time in the kernel. One step with no kernel entry is a load and a
+// TSC read, about 10 ns.
+constexpr double kernel_gap_threshold_ns = 200;
 
 // Runs the filler warmup_runs times on the calling thread, with no offload.
 // Returns the checksum of the last run: the reference output.
@@ -1432,24 +1440,165 @@ static void measure_qat_floor(const Options &options, const TscClock &clock,
          percentile(floors_ns, 0.9), percentile(floors_ns, 0.99));
 }
 
+static void print_median_and_tail(const std::vector<double> &values_ns) {
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(values_ns, 0.5), percentile(values_ns, 0.1),
+         percentile(values_ns, 0.9), percentile(values_ns, 0.99));
+}
+
+// The kernel time of the QAT completion. Run with --cpu on the CPU of the QAT
+// interrupt (the busiest_interrupt_cpu of qat-floor) and --observer-cpu on its
+// SMT sibling. After the submit, the filler CPU loads the completion byte and
+// reads the TSC in a tight loop. A step between two TSC reads longer than
+// kernel_gap_threshold_ns is a gap: the CPU was in the kernel. The last gap
+// before the filler CPU sees the byte is the QAT interrupt: it starts when
+// the interrupt stops the loop and ends when the kernel returns to it, and the
+// kernel writes the byte inside it. Each run is split in four parts:
+//   device_and_delivery  submit end to the gap start: the rest of the copy to
+//                        the device, the device, its interrupt coalescing
+//                        timer and the MSI-X delivery to the CPU. The device
+//                        gives no time stamp, so these do not split.
+//   entry_to_seen        the gap start to the observer seeing the byte: the
+//                        interrupt handler, the tasklet and the crypto and AIO
+//                        callbacks to the io_event write, plus the observer lag
+//                        (signal-floor from this CPU to the observer CPU)
+//   seen_to_return       the observer seeing the byte to the gap end: the rest
+//                        of the kernel path, minus the observer lag
+//   gap                  the gap length: the CPU time that the completion takes
+//                        from the program on the interrupt CPU
+// The other gaps (before the last gap of a run) are mostly timer ticks: their
+// length is the cost of an interrupt with a short handler, for comparison.
+// The split counts only runs where the observer sees the byte inside the last
+// gap. The loop loads the byte before it reads the TSC, and tests the step
+// before it stops, so a kernel entry between any two instructions of the loop
+// is a gap.
+static void measure_qat_interrupt(const Options &options, const TscClock &clock,
+                                  QatDecryptOffload &offload, CompletionObserver &observer) {
+  std::vector<double> submits_ns;
+  std::vector<double> offloads_ns;
+  std::vector<double> device_and_deliveries_ns;
+  std::vector<double> entries_to_seen_ns;
+  std::vector<double> seens_to_return_ns;
+  std::vector<double> gaps_ns;
+  int failed_offloads = 0;
+  int completed_during_submit_count = 0;
+  int runs_without_gap = 0;
+  int seen_outside_gap_count = 0;
+  std::vector<double> other_gaps_ns;  // gaps before the last gap of a run
+  uint64_t idle_ticks = static_cast<uint64_t>(clock.ns_to_ticks(options.idle_us * 1000));
+  uint64_t kernel_gap_threshold_ticks =
+      static_cast<uint64_t>(clock.ns_to_ticks(kernel_gap_threshold_ns));
+  auto ns_between = [&clock](uint64_t from_tsc, uint64_t to_tsc) {
+    return clock.ticks_to_ns(static_cast<double>(static_cast<int64_t>(to_tsc - from_tsc)));
+  };
+  std::map<int, uint64_t> interrupts_before;
+  for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
+    if (run_index == warmup_runs) {
+      interrupts_before = read_qat_interrupts_per_cpu();
+    }
+    volatile uint8_t *completion_byte = offload.prepare();
+    observer.watch(completion_byte);
+    uint64_t idle_start_tsc = read_tsc();
+    while (read_tsc() - idle_start_tsc < idle_ticks) {
+    }
+    uint64_t submit_start_tsc = read_tsc();
+    offload.submit();
+    uint64_t submit_end_tsc = read_tsc();
+    bool completed_during_submit = *completion_byte != 0;
+    uint64_t previous_tsc = read_tsc();
+    uint64_t last_gap_start_tsc = 0;
+    uint64_t last_gap_end_tsc = 0;
+    int gap_count = 0;
+    std::vector<double> gaps_of_run_ns;  // empty unless a run has more than one gap
+    for (;;) {
+      bool completed = *completion_byte != 0;
+      uint64_t now_tsc = read_tsc();
+      if (now_tsc - previous_tsc > kernel_gap_threshold_ticks) {
+        if (gap_count > 0) {
+          gaps_of_run_ns.push_back(ns_between(last_gap_start_tsc, last_gap_end_tsc));
+        }
+        last_gap_start_tsc = previous_tsc;
+        last_gap_end_tsc = now_tsc;
+        gap_count++;
+      }
+      previous_tsc = now_tsc;
+      if (completed) {
+        break;
+      }
+    }
+    bool offload_output_correct = offload.reap();
+    uint64_t completion_seen_tsc = observer.wait_for_completion_tsc();
+    if (run_index < warmup_runs) {
+      continue;
+    }
+    if (!offload_output_correct) {
+      failed_offloads++;
+    }
+    submits_ns.push_back(ns_between(submit_start_tsc, submit_end_tsc));
+    offloads_ns.push_back(ns_between(submit_start_tsc, completion_seen_tsc));
+    if (completed_during_submit) {
+      completed_during_submit_count++;
+      continue;
+    }
+    if (gap_count == 0) {
+      runs_without_gap++;
+      continue;
+    }
+    other_gaps_ns.insert(other_gaps_ns.end(), gaps_of_run_ns.begin(), gaps_of_run_ns.end());
+    bool seen_inside_gap =
+        last_gap_start_tsc <= completion_seen_tsc && completion_seen_tsc <= last_gap_end_tsc;
+    if (!seen_inside_gap) {
+      seen_outside_gap_count++;
+      continue;
+    }
+    device_and_deliveries_ns.push_back(ns_between(submit_end_tsc, last_gap_start_tsc));
+    entries_to_seen_ns.push_back(ns_between(last_gap_start_tsc, completion_seen_tsc));
+    seens_to_return_ns.push_back(ns_between(completion_seen_tsc, last_gap_end_tsc));
+    gaps_ns.push_back(ns_between(last_gap_start_tsc, last_gap_end_tsc));
+  }
+  std::map<int, uint64_t> interrupts_after = read_qat_interrupts_per_cpu();
+  QatInterrupts interrupts = qat_interrupts_between(interrupts_before, interrupts_after);
+  uint64_t filler_cpu_interrupts = interrupts_after[options.cpu] - interrupts_before[options.cpu];
+  // Each completion is one interrupt of the response ring. With fewer on the
+  // filler CPU, the gaps are not the QAT interrupt.
+  if (filler_cpu_interrupts < static_cast<uint64_t>(options.runs)) {
+    fprintf(stderr,
+            "qat-interrupt: CPU %d handled %" PRIu64 " QAT interrupts in %d runs; the QAT "
+            "interrupts are on CPU %d. Run with --cpu %d and its SMT sibling as --observer-cpu.\n",
+            options.cpu, filler_cpu_interrupts, options.runs, interrupts.busiest_cpu,
+            interrupts.busiest_cpu);
+    exit(1);
+  }
+  printf("qat-interrupt,%d,%d,%zu,%g,%d,%d,%d,%d,%d,%zu,%" PRIu64 ",%" PRIu64, options.cpu,
+         options.observer_cpu, options.offload_bytes, options.idle_us, options.runs,
+         failed_offloads, completed_during_submit_count, runs_without_gap,
+         seen_outside_gap_count, other_gaps_ns.size(), interrupts.total, filler_cpu_interrupts);
+  printf(",%.0f,%.0f", percentile(submits_ns, 0.5), percentile(offloads_ns, 0.5));
+  print_median_and_tail(device_and_deliveries_ns);
+  print_median_and_tail(entries_to_seen_ns);
+  print_median_and_tail(seens_to_return_ns);
+  print_median_and_tail(gaps_ns);
+  printf(",%.0f,%.0f\n", percentile(other_gaps_ns, 0.5), percentile(other_gaps_ns, 0.9));
+}
+
 // ---------------------------------------------------------------------------
 // Command line
 
 static void print_usage(FILE *stream) {
   fprintf(stream,
-          "usage: preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor\n"
-          "                     [options]\n"
+          "usage: preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|\n"
+          "                            qat-interrupt [options]\n"
           "  --filler NAME        a filler, or all (default); repeat for more than one\n"
           "  --size BYTES         input size of each filler, a multiple of 64 (default 65536)\n"
           "  --runs N             measured runs (default 2000 overhead, 1000 latency and\n"
-          "                       qat-latency, 10000 signal-floor and qat-floor)\n"
+          "                       qat-latency, 10000 signal-floor, qat-floor and\n"
+          "                       qat-interrupt)\n"
           "  --cpu N              CPU of the filler (default 2)\n"
           "  --accelerator-cpu N  CPU of the emulated accelerator (default 4)\n"
           "  --observer-cpu N     qat modes: CPU of the completion observer (default 6)\n"
           "  --offload-bytes N    qat modes: bytes of each QAT decrypt, a multiple of 16,\n"
           "                       at most 65536 (default 4096)\n"
-          "  --idle-us N          qat-floor mode: the device is idle for N us before each\n"
-          "                       offload (default 0)\n"
+          "  --idle-us N          qat-floor and qat-interrupt modes: the device is idle for\n"
+          "                       N us before each offload (default 0)\n"
           "  --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]\n"
           "                       in latency mode, 1000 in signal-floor mode\n"
           "  --seed N             seed of the inputs and the offload times of each filler\n"
@@ -1565,7 +1714,8 @@ static Options parse_options(int argc, char **argv) {
     }
   }
   if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor" &&
-      options.mode != "qat-latency" && options.mode != "qat-floor") {
+      options.mode != "qat-latency" && options.mode != "qat-floor" &&
+      options.mode != "qat-interrupt") {
     print_usage(stderr);
     exit(2);
   }
@@ -1697,6 +1847,26 @@ int main(int argc, char **argv) {
     QatDecryptOffload offload(options.offload_bytes, offload_random);
     CompletionObserver observer(options.observer_cpu);
     measure_qat_floor(options, clock, offload, observer);
+    return 0;
+  }
+
+  if (options.mode == "qat-interrupt") {
+    if (options.print_header) {
+      printf(
+          "mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,"
+          "runs_without_gap,seen_outside_gap,other_gaps,qat_interrupts,filler_cpu_interrupts,"
+          "submit_median_ns,offload_median_ns,"
+          "device_and_delivery_median_ns,device_and_delivery_p10_ns,device_and_delivery_p90_ns,"
+          "device_and_delivery_p99_ns,"
+          "entry_to_seen_median_ns,entry_to_seen_p10_ns,entry_to_seen_p90_ns,entry_to_seen_p99_ns,"
+          "seen_to_return_median_ns,seen_to_return_p10_ns,seen_to_return_p90_ns,"
+          "seen_to_return_p99_ns,"
+          "gap_median_ns,gap_p10_ns,gap_p90_ns,gap_p99_ns,other_gap_median_ns,other_gap_p90_ns\n");
+    }
+    std::mt19937_64 offload_random(options.seed);
+    QatDecryptOffload offload(options.offload_bytes, offload_random);
+    CompletionObserver observer(options.observer_cpu);
+    measure_qat_interrupt(options, clock, offload, observer);
     return 0;
   }
 

@@ -374,9 +374,19 @@ is not in it. So the runs are on emerald-02.
    the operation and the IV. The kernel copies the ciphertext.
 2. `io_submit` of a read (`IOCB_CMD_PREAD`) of the plaintext starts the
    decrypt on the device and returns at once (`-EIOCBQUEUED` in the kernel).
-3. The device raises its MSI-X interrupt on one CPU. The completion
-   (`af_alg_async_cb`, then `aio_complete`) writes the io_event into the AIO
-   ring at `events[tail]`, then moves `tail` on.
+3. The device writes its response into the response ring of its bank in
+   host memory and sends an MSI-X message (a PCIe memory write, remapped by
+   the IOMMU to a vector of one CPU: `IR-PCI-MSIX`, `qat4-bundle1` on CPU 113).
+   On that CPU, `adf_msix_isr_bundle` masks the bank interrupt and schedules
+   a high-priority tasklet. At the interrupt exit, the softirq runs the
+   tasklet `adf_response_handler`: `qat_alg_callback`,
+   `qat_skcipher_alg_callback`, the skcipher completion, `af_alg_async_cb`
+   and `aio_complete`. `aio_complete` writes the io_event into the AIO ring at
+   `events[tail]`, then moves `tail` on. The tasklet then unmasks the bank
+   interrupt. All of this runs on the interrupt CPU, in the time of the
+   program that the interrupt stopped. The Linux 6.8 driver sets the
+   interrupt coalescing timer of the bank to its minimum (511,
+   `ADF_COALESCING_MIN_TIME`).
 4. The AIO ring is mapped into user memory by `io_setup`. Before the submit,
    `prepare()` clears the `data` field of `events[tail]`; the completion sets it
    to 1 (`aio_data`). The low byte of `data` is the completion byte that
@@ -404,12 +414,27 @@ gives the time from the kernel write to the observer seeing the byte; the
   with no filler. The floor is the filler CPU seeing the byte minus the
   observer seeing it. It also gives the offload time at each size and after
   `--idle-us` of device idle.
+- **qat-interrupt** gives the time of the interrupt path. Put the filler on
+  the interrupt CPU and the observer on its SMT sibling. The filler CPU loads
+  the completion byte and reads the TSC in a tight loop. A TSC step longer
+  than 200 ns is a gap: the CPU was in the kernel. The last gap before the
+  byte is set is the QAT interrupt, and the observer sees the kernel write of
+  the byte inside it. Each run splits in four: the submit end to the gap
+  start (device and delivery: the device, the coalescing timer and the MSI-X
+  message, which do not split without a device time stamp), the gap start to
+  the observer seeing the byte (the kernel path to the write, plus the
+  observer lag), the observer seeing the byte to the gap end (the return,
+  minus the observer lag) and the gap length (the CPU time of the interrupt).
+  The other gaps (mostly timer ticks) give the cost of an interrupt with a
+  short handler. The mode stops when the filler CPU handles fewer QAT
+  interrupts than runs.
 
 CSV columns:
 
 - qat-latency: `mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,yielded,finished_after_completion,finished_before_completion,wrong_outputs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,detect_median_ns,detect_p90_ns,detect_p99_ns,switch_median_ns,switch_p90_ns,switch_p99_ns,filler_median_ns`
 - `--samples`: `probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct`
 - qat-floor: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns`
+- qat-interrupt: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,runs_without_gap,seen_outside_gap,other_gaps,qat_interrupts,filler_cpu_interrupts,submit_median_ns,offload_median_ns`, then the median, p10, p90 and p99 of `device_and_delivery`, `entry_to_seen`, `seen_to_return` and `gap` (`..._median_ns,..._p10_ns,..._p90_ns,..._p99_ns`), then `other_gap_median_ns,other_gap_p90_ns`
 
 ### QAT results
 
@@ -516,6 +541,49 @@ interrupt CPU of the instance). The latency columns are the dense kernels
 - On the interrupt CPU, `decrypt-chunked` detects in 1.7-1.9 µs (129 ns
   with the interrupt on another CPU), and its `off` runtime is 12-16 µs longer
   (120 µs). The cause is not studied yet.
+
+#### Interrupt path
+
+`qat-interrupt`, filler on CPU 113 (the interrupt CPU), observer on CPU 41
+(its SMT sibling), 10,000 runs (200 runs with device idle). Observer lag
+(signal-floor from CPU 113 to CPU 41) is 63 ns: the write is the observer
+time minus 63 ns. In each row, CPU 113 handles one QAT interrupt a run, and at
+most 16 of 10,000 runs are not in the split (done in the submit, or the
+observer saw the byte outside the gap).
+
+| Offload | Device idle before | Submit median | Offload median | Device and delivery median | Interrupt to write median (p99) | Write to return median | Gap median (p99) |
+|---|---|---|---|---|---|---|---|
+| 16 B | 0 | 6.70 µs | 13.2 µs | 3.64 µs | 2.79 µs (14.5 µs) | 535 ns | 3.33 µs (15.0 µs) |
+| 4 KiB | 0 | 7.80 µs | 16.9 µs | 5.89 µs | 3.13 µs (14.9 µs) | 533 ns | 3.66 µs (15.5 µs) |
+| 8 KiB | 0 | 10.1 µs | 23.2 µs | 9.13 µs | 3.85 µs (15.7 µs) | 536 ns | 4.39 µs (16.3 µs) |
+| 16 KiB | 0 | 14.7 µs | 33.1 µs | 13.1 µs | 5.27 µs (17.3 µs) | 528 ns | 5.80 µs (17.9 µs) |
+| 32 KiB | 0 | 23.7 µs | 50.3 µs | 18.5 µs | 7.95 µs (20.3 µs) | 532 ns | 8.48 µs (20.9 µs) |
+| 64 KiB | 0 | 41.6 µs | 84.4 µs | 29.5 µs | 13.0 µs (28.6 µs) | 528 ns | 13.5 µs (29.5 µs) |
+| 4 KiB | 10 ms | 7.95 µs | 45.5 µs | 33.6 µs | 3.61 µs (3.99 µs) | 535 ns | 4.14 µs (4.55 µs) |
+
+- The kernel writes the completion byte 2.79 µs (16 B) to 3.13 µs (4 KiB)
+  after the interrupt gets to the CPU, and 0.66-0.72 µs later for each
+  4 KiB page after the first (13.0 µs at 64 KiB). A device that writes its
+  completion record itself (DSA, IAA, the emulated accelerator) does not
+  have this delay. The per-page cause is not measured (no kernel profiler:
+  `perf_event_paranoid` is 4). The completion unmaps (IOMMU in lazy mode,
+  `DMA-FQ`) and releases the source and destination pages.
+- Device and delivery holds the device time, the coalescing timer and the
+  MSI-X message. At 16 B it is 3.64 µs, so the coalescing timer and the MSI-X
+  delivery together are at most 3.64 µs. Relative to a direct write at the
+  device end, the interrupt makes the completion 2.79 µs (16 B) to 6.43 µs
+  later.
+- From the write to the return to the program is 528-536 ns at each size.
+  This is the 466 ns floor of the "Filler on the interrupt CPU" placement
+  (plus the 63 ns lag).
+- The gap is the CPU time that each completion takes from the program on the
+  interrupt CPU: 3.33 µs (16 B), 3.66 µs (4 KiB), 13.5 µs (64 KiB). The
+  other gaps on the same CPU (mostly timer ticks, 66 to 301 a row from
+  8 KiB) have a median of 3.82-4.02 µs.
+- 1 % of the completions take about 11 µs more in the kernel (p99). The
+  cause is not measured.
+- After 10 ms of device idle, the device and delivery part is 33.6 µs and the
+  kernel path does not change (3.61 µs): the power state is in the device.
 
 ## Limits
 
