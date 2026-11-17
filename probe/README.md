@@ -27,7 +27,7 @@ plugin with the new pass manager. It keeps the symbol names and the
 | `CMakeLists.txt` | the superbuild: abseil, protobuf, ipp-crypto, workloads |
 | `workloads/` | `racer_kernels`, `racer_router_proto`, `aes_gcm_chunked`, `preempt_bench` |
 | `test/pass/*.ll` | `opt` tests of the pass, run by `ctest` |
-| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py`, `run-qat-bench.sh`, `summarize-qat.py` |
+| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py`, `run-qat-bench.sh`, `summarize-qat.py`, `build-preemption-slide.py` |
 
 ## Usage
 
@@ -54,6 +54,9 @@ default 10), `latency.csv`, `samples-<build>.csv` (each latency run) and
 `signal-floor.csv`. The arguments after the output directory go to each run.
 `summarize.py` joins these CSVs into the tables of [Results](#results).
 `run-qat-bench.sh` and `summarize-qat.py` do the same for the QAT modes.
+`build-preemption-slide.py` draws one slide (python-pptx) from the medians of
+[Interrupt path](#interrupt-path) and [Accelerator placement](#accelerator-placement):
+the MSI-X path next to a completion record that the device writes itself.
 
 To probe another library, compile it with
 
