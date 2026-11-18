@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Builds one slide: where the preemption time goes with an MSI-X completion
-(QAT, measured) and with a completion record that the device writes itself
-(DSA / IAA, emulated).
+(QAT, measured on emerald-02) and with a completion record that the device
+writes itself (DSA, measured on sapphire).
 
   ~/Rack-Runtime/.venv/bin/python probe/scripts/build-preemption-slide.py
   soffice --headless --convert-to pdf --outdir ~/Rack-Runtime/Slides \
       ~/Rack-Runtime/Slides/racer-preemption-paths.pptx
 
-The times are the medians of the README tables "Interrupt path" and
-"Accelerator placement", at 4 KiB offloads. Time 0 is the time at which the
-completion gets to the CPU: the interrupt entry for MSI-X, the completion
-byte in memory for the completion record. The bars do not hold the time
-before that (device, coalescing timer and MSI-X message), because the
-device gives no time stamp.
+The times are the medians of the README tables "Interrupt path", "Placement"
+(QAT) and "DSA results", at 4 KiB offloads. Time 0 is the time at which the
+completion gets to the CPU: the interrupt entry for MSI-X, the status byte of
+the record at the program core for DSA. The bars do not hold the time before
+that (device, coalescing timer and MSI-X message; device and record write),
+because the devices give no time stamp.
 
 All drawings are shapes, so they can be edited in PowerPoint.
 """
@@ -53,12 +53,21 @@ TIMER_AND_MSIX_AT_MOST_US = 3.64
 # scheduler running again, dense kernels at interval 200.
 FROM_WRITE_FILLER_ON_INTERRUPT_CPU_US = (0.596, 0.739)
 FROM_WRITE_FILLER_ON_OTHER_CORE_US = (0.247, 0.298)
-# README "Accelerator placement", accelerator thread on the same socket.
-EMULATED_LATENCY_US = (0.244, 0.265)
-EMULATED_LATENCY_P99_US = (0.294, 0.357)
-CACHE_LINE_TO_PROGRAM_CORE_NS = 188
-TO_NEXT_PROBE_NS = (14, 24)
-SWITCH_NS = (40, 52)
+# README QAT "Interrupt path", 4 KiB.
+MSIX_SUBMIT_US, MSIX_OFFLOAD_US = 7.80, 16.9
+# README "DSA results": latency from the status byte of the completion record
+# at the program core to the scheduler running again, dense kernels at
+# interval 200, shared and dedicated WQ.
+DSA_LATENCY_NS = (37, 125)
+DSA_LATENCY_P99_NS = (46, 450)
+DSA_TO_NEXT_PROBE_NS = (7, 46)
+DSA_SWITCH_NS = (31, 41)
+# dsa-floor, 4 KiB, dedicated and shared WQ: the write() submit and the offload
+# (start of the submit to the byte); at 16 B the byte is seen this long after
+# the submit returns.
+DSA_SUBMIT_US = (1.17, 1.35)
+DSA_OFFLOAD_US = (2.14, 3.48)
+DSA_AFTER_SUBMIT_16_BYTES_US = (0.22, 0.42)
 
 AXIS_ZERO_X, INCHES_PER_US, AXIS_MAX_US = 3.0, 2.4, 4.0
 LABEL_X = 0.49
@@ -67,7 +76,7 @@ AXIS_Y = 2.27
 ROW_Y = [2.37, 2.97, 3.57]
 BAR_HEIGHT = 0.42
 ZOOM_Y, ZOOM_X, ZOOM_WIDTH = 4.2, AXIS_ZERO_X, 6.6
-LOWER_SECTION_Y = 4.88
+LOWER_SECTION_Y = 4.75
 
 
 def middle(time_range):
@@ -164,7 +173,7 @@ def remove_all_slides(presentation):
 def draw_legend(slide):
     entries = [(KERNEL_COLOR, "Kernel: interrupt → completion write", 3.0),
                (RETURN_COLOR, "Kernel: write → return to the program", 3.1),
-               (SIGNAL_COLOR, "Cache line to the program core + probe point + switch", 4.0)]
+               (SIGNAL_COLOR, "Cache line (MSI-X), probe point, switch", 3.4)]
     x = AXIS_ZERO_X
     for color, label, width in entries:
         add_box(slide, x, LEGEND_Y + 0.06, 0.16, 0.16, fill=color, line=None)
@@ -191,8 +200,8 @@ def draw_bar(slide, y, segments, total_label):
 
 def draw_axis(slide):
     """The time axis is on top of the bars, so that the zoom of the completion record can go below them."""
-    add_text(slide, LABEL_X, AXIS_Y - 0.27, AXIS_ZERO_X - LABEL_X - 0.4, 0.25,
-             ["time after the completion"], size_pt=10, color=MUTED, align=PP_ALIGN.RIGHT)
+    add_text(slide, LABEL_X, AXIS_Y - 0.27, AXIS_ZERO_X - LABEL_X - 0.3, 0.25,
+             ["from the completion at the CPU"], size_pt=10, color=MUTED, align=PP_ALIGN.RIGHT)
     add_line(slide, AXIS_ZERO_X, AXIS_Y, AXIS_ZERO_X, ROW_Y[-1] + BAR_HEIGHT + 0.05, color=TEXT)
     add_line(slide, AXIS_ZERO_X, AXIS_Y, x_of_time(AXIS_MAX_US), AXIS_Y, color=RULE)
     for tick_us in range(int(AXIS_MAX_US) + 1):
@@ -203,10 +212,9 @@ def draw_axis(slide):
 
 
 def draw_record_zoom(slide, bar_y, bar_end_x):
-    """The completion-record bar again, in ns, below the bars, so that its three parts can be read."""
-    parts = [(CACHE_LINE_TO_PROGRAM_CORE_NS, f"cache line to the program core  {CACHE_LINE_TO_PROGRAM_CORE_NS} ns"),
-             (middle(TO_NEXT_PROBE_NS), None),
-             (middle(SWITCH_NS), f"switch {SWITCH_NS[0]}-{SWITCH_NS[1]} ns")]
+    """The completion-record bar again, in ns, below the bars, so that its two parts can be read."""
+    parts = [(middle(DSA_TO_NEXT_PROBE_NS), f"to the next probe point  {DSA_TO_NEXT_PROBE_NS[0]}-{DSA_TO_NEXT_PROBE_NS[1]} ns"),
+             (middle(DSA_SWITCH_NS), f"switch  {DSA_SWITCH_NS[0]}-{DSA_SWITCH_NS[1]} ns")]
     inches_per_ns = ZOOM_WIDTH / sum(time_ns for time_ns, _ in parts)
     zoom_height = 0.36
     add_line(slide, AXIS_ZERO_X, bar_y + BAR_HEIGHT, ZOOM_X, ZOOM_Y, color=RULE, dashed=True)
@@ -219,10 +227,6 @@ def draw_record_zoom(slide, bar_y, bar_end_x):
         add_box(slide, x, ZOOM_Y, inches_per_ns * time_ns, zoom_height, [label] if label else (), fill=SIGNAL_FILL,
                 line=SIGNAL_COLOR, size_pt=10)
         x += inches_per_ns * time_ns
-    probe_x = ZOOM_X + inches_per_ns * (CACHE_LINE_TO_PROGRAM_CORE_NS + middle(TO_NEXT_PROBE_NS) / 2)
-    add_text(slide, probe_x - 1.2, ZOOM_Y + zoom_height, 2.4, 0.22,
-             [f"to the next probe point {TO_NEXT_PROBE_NS[0]}-{TO_NEXT_PROBE_NS[1]} ns"], size_pt=10, color=MUTED,
-             align=PP_ALIGN.CENTER)
 
 
 def draw_timeline(slide):
@@ -242,9 +246,9 @@ def draw_timeline(slide):
                                (middle(FROM_WRITE_FILLER_ON_OTHER_CORE_US), SIGNAL_COLOR, None)],
              f"{total_us:.1f} µs")
 
-    draw_row_label(slide, ROW_Y[2], "Completion record", "DSA / IAA, emulated")
-    bar_end_x = draw_bar(slide, ROW_Y[2], [(middle(EMULATED_LATENCY_US), SIGNAL_COLOR, None)],
-                         f"{EMULATED_LATENCY_US[0]:.2f}-{EMULATED_LATENCY_US[1]:.2f} µs")
+    draw_row_label(slide, ROW_Y[2], "Completion record (DSA)", "device writes the record")
+    bar_end_x = draw_bar(slide, ROW_Y[2], [(middle(DSA_LATENCY_NS) / 1000, SIGNAL_COLOR, None)],
+                         f"{DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns")
     draw_record_zoom(slide, ROW_Y[2], bar_end_x)
     draw_axis(slide)
 
@@ -254,23 +258,24 @@ def draw_paths(slide, x, y, width):
              [[("MSI-X path", True, None), ("  (QAT 4xxx, AF_ALG + AIO, Linux 6.8)", False, MUTED)],
               "device DMA → coalescing timer → MSI-X → ISR masks the bank → HI tasklet → QAT and AF_ALG "
               "callbacks → aio_complete writes the io_event → return to the program → probe point → switch",
-              [("Completion-record path", True, None), ("  (DSA / IAA)", False, MUTED)],
-              "ENQCMD or MOVDIR64B: 64 B descriptor → device works on user addresses (PASID, SVA) → "
-              "device writes a 32 B completion record → probe point sees the status byte → switch"],
+              [("Completion-record path", True, None), ("  (DSA, Linux 6.8 idxd)", False, MUTED)],
+              "write() of the 64 B descriptor → the driver gives it to the WQ (MOVDIR64B or ENQCMDS) → "
+              "device moves the bytes at user addresses (PASID, SVA) → device writes a 32 B completion record → "
+              "probe point sees the status byte → switch"],
              size_pt=11)
 
 
 def draw_comparison(slide, x, y):
     column_widths = [2.8, 1.35, 1.75]
-    row_height = 0.28
-    rows = [("4 KiB offloads", "MSI-X", "Completion record"),
-            ("Completion → switch", "3.4-3.8 µs",
-             f"{EMULATED_LATENCY_US[0]:.2f}-{EMULATED_LATENCY_US[1]:.2f} µs"),
+    row_height = 0.26
+    rows = [("4 KiB offloads", "MSI-X (QAT)", "Record (DSA)"),
+            ("Completion at the CPU → switch", "3.4-3.8 µs", f"{DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns"),
             ("Kernel CPU time, each completion", f"{KERNEL_CPU_TIME_US:.2f} µs", "0 (no interrupt)"),
             ("Kernel time, each 4 KiB more",
              f"+{KERNEL_TIME_EACH_MORE_PAGE_US[0]:.2f}-{KERNEL_TIME_EACH_MORE_PAGE_US[1]:.2f} µs", "0 (32 B record)"),
-            ("Slowest 1 %", "+11 µs (kernel)",
-             f"p99 {EMULATED_LATENCY_P99_US[0]:.2f}-{EMULATED_LATENCY_P99_US[1]:.2f} µs")]
+            ("Slowest 1 %", "+11 µs (kernel)", f"p99 {DSA_LATENCY_P99_NS[0]}-{DSA_LATENCY_P99_NS[1]} ns"),
+            ("Submit / offload", f"{MSIX_SUBMIT_US:.2f} / {MSIX_OFFLOAD_US:.1f} µs",
+             f"{DSA_SUBMIT_US[0]:.1f}-{DSA_SUBMIT_US[1]:.1f} / {DSA_OFFLOAD_US[0]:.1f}-{DSA_OFFLOAD_US[1]:.1f} µs")]
     for row_index, row in enumerate(rows):
         row_y = y + row_height * row_index
         cell_x = x
@@ -287,25 +292,31 @@ def draw_comparison(slide, x, y):
 
 def draw_footnote(slide):
     add_text(slide, LABEL_X, 6.42, 12.4, 0.5,
-             ["0 µs: the interrupt entry (MSI-X) or the byte in memory (record). Medians, emerald-02, 10,000 "
-              "offloads a row. Not in the bars: device + coalescing timer + MSI-X message, "
-              f"{DEVICE_AND_DELIVERY_US:.2f} µs at 4 KiB (timer + MSI-X ≤ {TIMER_AND_MSIX_AT_MOST_US:.2f} µs). "
-              "Record: another core of the same socket writes the byte; DSA / IAA submit and device time are not "
-              "measured (user work queues need root)."],
+             ["0 µs: the interrupt entry (MSI-X) or the record byte at the program core (DSA). Medians. "
+              "MSI-X: QAT 4xxx decrypt, emerald-02, 10,000 offloads a row. DSA: dsa0 memory move, sapphire, "
+              "7 dense kernels at probe interval 200, shared and dedicated WQ. Not in the bars: QAT device + "
+              f"coalescing timer + MSI-X message, {DEVICE_AND_DELIVERY_US:.2f} µs (timer + MSI-X ≤ "
+              f"{TIMER_AND_MSIX_AT_MOST_US:.2f} µs); DSA device + record write, not measured (16 B: the byte "
+              f"{DSA_AFTER_SUBMIT_16_BYTES_US[0]:.2f}-{DSA_AFTER_SUBMIT_16_BYTES_US[1]:.2f} µs after the submit "
+              "returns). The DSA submit is a write() system "
+              "call: the idxd driver does not map the WQ portal on this DSA (erratum CVE-2024-21823)."],
              size_pt=10, color=MUTED)
 
 
 def build_slide(presentation):
     slide = add_slide(
-        presentation, "Where the Time Goes: MSI-X vs. DSA/IAA",
+        presentation, "Where the Time Goes: MSI-X vs. DSA",
         "Time from the completion to the switch of the program to the scheduler, at 4 KiB offloads. "
-        "MSI-X (QAT, measured): the kernel handles the interrupt and writes the completion byte 3.13 µs after "
-        "the interrupt gets to the CPU. A program on the interrupt CPU runs again 0.53 µs after the write. A "
-        "program on another core sees the byte 0.25-0.30 µs after the write. A device that writes its "
-        "completion record itself (DSA, IAA) has no kernel step: the program sees the byte 0.24-0.27 µs after "
-        "the write (emulated with another core). Most of that time is the move of the cache line to the "
-        "program core (188 ns). The MSI-X kernel time also takes 3.66 µs of CPU time from the program on the "
-        "interrupt CPU for each completion, and grows by 0.66-0.72 µs for each 4 KiB page.")
+        "MSI-X (QAT, measured on emerald-02): the kernel handles the interrupt and writes the completion byte "
+        "3.13 µs after the interrupt gets to the CPU. A program on the interrupt CPU runs again 0.53 µs after "
+        "the write. A program on another core sees the byte 0.25-0.30 µs after the write. A DSA device writes "
+        "its completion record itself (measured on sapphire): there is no interrupt and no kernel code, and the "
+        f"program switches {DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns after the byte gets to its core "
+        f"({DSA_TO_NEXT_PROBE_NS[0]}-{DSA_TO_NEXT_PROBE_NS[1]} ns to the next probe point, "
+        f"{DSA_SWITCH_NS[0]}-{DSA_SWITCH_NS[1]} ns to switch). The MSI-X kernel time also takes 3.66 µs of "
+        "CPU time from the program on the interrupt CPU for each completion, and grows by 0.66-0.72 µs for "
+        "each 4 KiB page. On sapphire the DSA submit is a write() system call, because the driver does not map "
+        "the WQ portal on a DSA with the user-submission erratum.")
     draw_timeline(slide)
     draw_paths(slide, LABEL_X, LOWER_SECTION_Y, 6.3)
     draw_comparison(slide, 6.95, LOWER_SECTION_Y)

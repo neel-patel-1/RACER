@@ -27,7 +27,7 @@ plugin with the new pass manager. It keeps the symbol names and the
 | `CMakeLists.txt` | the superbuild: abseil, protobuf, ipp-crypto, workloads |
 | `workloads/` | `racer_kernels`, `racer_router_proto`, `aes_gcm_chunked`, `preempt_bench` |
 | `test/pass/*.ll` | `opt` tests of the pass, run by `ctest` |
-| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py`, `run-qat-bench.sh`, `summarize-qat.py`, `build-preemption-slide.py` |
+| `scripts/` | `build.sh`, `count-probes.sh`, `run-bench.sh`, `summarize.py`, `run-qat-bench.sh`, `summarize-qat.py`, `run-dsa-bench.sh`, `summarize-dsa.py`, `build-preemption-slide.py` |
 
 ## Usage
 
@@ -53,10 +53,11 @@ modes and writes `overhead.csv` (`OVERHEAD_SWEEPS` sweeps over the builds,
 default 10), `latency.csv`, `samples-<build>.csv` (each latency run) and
 `signal-floor.csv`. The arguments after the output directory go to each run.
 `summarize.py` joins these CSVs into the tables of [Results](#results).
-`run-qat-bench.sh` and `summarize-qat.py` do the same for the QAT modes.
+`run-qat-bench.sh` and `summarize-qat.py` do the same for the QAT modes, and
+`run-dsa-bench.sh` and `summarize-dsa.py` for the DSA modes.
 `build-preemption-slide.py` draws one slide (python-pptx) from the medians of
-[Interrupt path](#interrupt-path) and [Accelerator placement](#accelerator-placement):
-the MSI-X path next to a completion record that the device writes itself.
+[Interrupt path](#interrupt-path) and [DSA results](#dsa-results): the MSI-X
+path of QAT next to the completion record that a DSA device writes itself.
 
 To probe another library, compile it with
 
@@ -120,24 +121,32 @@ nothing.
 ## preempt_bench
 
 ```
-preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor
-              [options]
+preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|
+              qat-interrupt|dsa-latency|dsa-floor [options]
   --filler NAME        a filler, or all (default); repeat for more than one
   --size BYTES         input size of each filler, a multiple of 64 (default 65536)
-  --runs N             measured runs (default 2000 overhead, 1000 latency and
-                       qat-latency, 10000 signal-floor and qat-floor)
+  --runs N             measured runs (default 2000 overhead, 1000 latency,
+                       qat-latency and dsa-latency, 10000 signal-floor,
+                       qat-floor, qat-interrupt and dsa-floor)
   --cpu N              CPU of the filler (default 2)
   --accelerator-cpu N  CPU of the emulated accelerator (default 4)
-  --observer-cpu N     qat modes: CPU of the completion observer (default 6)
-  --offload-bytes N    qat modes: bytes of each QAT decrypt, a multiple of 16,
-                       at most 65536 (default 4096)
-  --idle-us N          qat-floor mode: the device is idle for N us before each
-                       offload (default 0)
+  --observer-cpu N     qat and dsa modes: CPU of the completion observer
+                       (default 6)
+  --offload-bytes N    qat and dsa modes: bytes of each offload (default 4096);
+                       for QAT a multiple of 16, at most 65536
+  --work-queue PATH    dsa modes: the user WQ of the DSA device (default
+                       /dev/dsa/wq0.1)
+  --idle-us N          qat-floor, qat-interrupt and dsa-floor modes: the device
+                       is idle for N us before each offload (default 0)
   --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]
                        in latency mode, 1000 in signal-floor mode
   --seed N             seed of the inputs and the offload times of each filler
-  --samples PATH       latency and qat-latency modes: also write each run to PATH
-  --ipp-code-path P    GCM code of ipp-crypto: native, aesni or portable-c
+                       (default 1)
+  --samples PATH       latency, qat-latency and dsa-latency modes: also write
+                       each run to PATH
+  --ipp-code-path P    GCM code of ipp-crypto: native (default; VAES assembly on
+                       AVX-512 CPUs), aesni (AES-NI assembly), or portable-c
+                       (table C code, which has probe points in its block loop)
   --no-header          do not print the CSV header
 ```
 
@@ -353,21 +362,24 @@ offload. The probe points and the filler builds do not change. Only the
 completion byte changes: it is in the io_event that the kernel writes when the
 device completes the request.
 
-### Why QAT and not DSA or IAA
-
-The lab hosts have DSA and IAA devices, but a user cannot submit work to them:
-
-- all DSA devices and their work queues are disabled;
-- the IAA devices have only the kernel work queue of the `iaa_crypto` driver;
-- there is no `/dev/dsa` or `/dev/iax`. A user work queue needs root
-  (`accel-config` or `scripts/accel_conf.py`).
+### QAT, DSA and IAA on the lab hosts
 
 The QAT devices (8086:4940: 8 on emerald-02, 4 on emerald-01 and emerald-03)
 are open to users through the kernel crypto API (AF_ALG sockets): the
 `qat_4xxx` driver gives `qat_aes_cbc`, `qat_aes_ctr` and `qat_aes_xts`. This
-needs no root and no device setup. `/dev/qat_adf_ctl` (the QAT user-space library) needs root. On
-sapphire the QAT functions are bound to vfio for the `qat` group, and the user
-is not in it. So the runs are on emerald-02.
+needs no root and no device setup. `/dev/qat_adf_ctl` (the QAT user-space
+library) needs root. On sapphire the QAT functions are bound to vfio. So the
+QAT runs are on emerald-02.
+
+A DSA or IAA user work queue (WQ) needs an administrator (`accel-config` or
+`scripts/accel_conf.py`). On the emerald hosts all DSA devices and WQs are
+disabled, and the IAA devices have only the kernel WQ of the `iaa_crypto`
+driver. On sapphire (2026-11-17) an administrator enabled two user WQs on
+`dsa0` (NUMA node 0), with their device files in the group `qat`:
+`/dev/dsa/wq0.0` (shared) and `/dev/dsa/wq0.1` (dedicated), both with
+`block_on_fault` 1. The [dsa modes](#dsa-accelerator) use them. The IAA WQ
+`iax3/wq3.0` is not enabled: `accel-config` stops with "WQ priority is 0", so
+it needs `accel-config config-wq iax3/wq3.0 --priority=10` before the enable.
 
 ### How a QAT offload completes
 
@@ -432,11 +444,16 @@ gives the time from the kernel write to the observer seeing the byte; the
   short handler. The mode stops when the filler CPU handles fewer QAT
   interrupts than runs.
 
+qat-latency and qat-floor count the involuntary context switches of the
+filler thread and of the observer thread during the measured runs
+(`nonvoluntary_ctxt_switches` of `/proc/self/task/TID/status`). A count above
+0 means other work ran on their CPUs: use idle CPUs, or run again.
+
 CSV columns:
 
-- qat-latency: `mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,yielded,finished_after_completion,finished_before_completion,wrong_outputs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,detect_median_ns,detect_p90_ns,detect_p99_ns,switch_median_ns,switch_p90_ns,switch_p99_ns,filler_median_ns`
+- qat-latency: `mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,yielded,finished_after_completion,finished_before_completion,wrong_outputs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,detect_median_ns,detect_p90_ns,detect_p99_ns,switch_median_ns,switch_p90_ns,switch_p99_ns,filler_median_ns,filler_involuntary_switches,observer_involuntary_switches`
 - `--samples`: `probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct`
-- qat-floor: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns`
+- qat-floor: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,submit_median_ns,submit_p99_ns,offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns,filler_involuntary_switches,observer_involuntary_switches`
 - qat-interrupt: `mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,runs_without_gap,seen_outside_gap,other_gaps,qat_interrupts,filler_cpu_interrupts,submit_median_ns,offload_median_ns`, then the median, p10, p90 and p99 of `device_and_delivery`, `entry_to_seen`, `seen_to_return` and `gap` (`..._median_ns,..._p10_ns,..._p90_ns,..._p99_ns`), then `other_gap_median_ns,other_gap_p90_ns`
 
 ### QAT results
@@ -588,6 +605,196 @@ observer saw the byte outside the gap).
 - After 10 ms of device idle, the device and delivery part is 33.6 µs and the
   kernel path does not change (3.61 µs): the power state is in the device.
 
+## DSA accelerator
+
+The dsa modes use a DSA device of sapphire (`dsa0`, NUMA node 0; see
+[the lab hosts](#qat-dsa-and-iaa-on-the-lab-hosts)). As with QAT, the probe
+points and the filler builds do not change. Only the completion byte changes:
+it is the status byte of the completion record that the device writes itself.
+No kernel code and no interrupt are on the completion path.
+
+### How a DSA offload completes
+
+`DsaMemmoveOffload` does one memory move (`DSA_OPCODE_MEMMOVE`) at a time:
+
+1. `prepare()` clears the destination and the next completion record (one
+   64-byte line of a pool of 1024 lines, as in `CompletionRecordPool`) and
+   puts the record address in the descriptor. The status byte of the record
+   is the completion byte that `preempt_signal` points to.
+2. `submit()` gives the 64-byte descriptor to the work queue (WQ). The fast
+   path is one instruction to the mapped WQ portal: `MOVDIR64B` to a
+   dedicated WQ, `ENQCMD` to a shared WQ. On sapphire the driver refuses the
+   `mmap` of the portal (`EPERM`): the first DSA (Sapphire Rapids) has a
+   user-submission erratum (CVE-2024-21823), and the Linux 6.8 `idxd` driver
+   then lets only a process with `CAP_SYS_RAWIO` map the portal. So the
+   program gives the descriptor with `write()` on the device file. The driver
+   checks it (no batch descriptor, an aligned completion record) and writes
+   it to the portal: `MOVDIR64B` to a dedicated WQ, `ENQCMDS` with the PASID
+   of the process to a shared WQ. This adds a system call to the submit; the
+   completion does not change.
+3. The device reads the source and writes the destination at the virtual
+   addresses of the program (shared virtual memory through the PASID; with
+   `block_on_fault` 1 the device waits on a page fault until the kernel maps
+   the page). Then it writes the 32-byte completion record: status 1 is
+   success. The descriptor does not ask for a completion interrupt, so the
+   `idxd` lines of `/proc/interrupts` do not change.
+4. `reap()` waits for the status, and the destination is compared with the
+   source.
+
+The constructor reads the WQ mode, `block_on_fault` and `max_transfer_size`
+from `/sys/bus/dsa/devices/<wq>/`, and runs one offload. It stops if the
+offload fails or the output is wrong.
+
+The device gives no completion time stamp, so the `CompletionObserver` of the
+qat modes reads the TSC when it sees the status byte. Put the observer on the
+SMT sibling of the filler CPU: the device writes the record, so the two CPUs
+see the byte at the same time, and the times start when the byte gets to the
+filler core. There is no kernel write, so there is no observer lag to add.
+
+- **dsa-latency** is qat-latency with the DSA offload (`--size 1048576`).
+- **dsa-floor** is qat-floor with the DSA offload.
+- `--work-queue PATH` picks the WQ (default `/dev/dsa/wq0.1`).
+- The CSV columns are those of qat-latency and qat-floor, with
+  `idxd_interrupts` in place of `qat_interrupts`.
+
+```
+scripts/run-dsa-bench.sh results/dsa 2 42 --size 1048576
+scripts/summarize-dsa.py results/dsa
+```
+
+`run-dsa-bench.sh` runs each WQ that the user can open: dsa-floor at 16 B,
+4 KiB and 64 KiB and after 0.1-100 ms of device idle, and dsa-latency of each
+build. `work-queues.csv` gives the mode and `block_on_fault` of each WQ.
+
+### DSA results
+
+Measured on sapphire (2026-11-17), filler on CPU 2 and observer on CPU 42
+(the SMT sibling of CPU 2), both on NUMA node 0 with `dsa0`, 1 MiB inputs
+and 4 KiB offloads, unless a row says other. The submit is the `write()`
+system call (see step 2 above). All filler and offload outputs are correct,
+and no offload fails. No row has an `idxd` interrupt (0.00 an offload), so
+the tables have no interrupt column. Other users' jobs ran on the host
+during the runs (load average 76-91 on 80 CPUs): the switch columns give the
+involuntary context switches of the filler and of the observer during the
+measured runs.
+
+#### Offload
+
+`dsa-floor`, 10,000 runs (200 runs with device idle). `wq0.1` is the
+dedicated WQ, `wq0.0` the shared WQ.
+
+| WQ | Offload | Device idle before | Submit median | Offload median | Offload p10 / p90 / p99 | Done in submit | Floor median (p10 / p90) | Switches filler / observer |
+|---|---|---|---|---|---|---|---|---|
+| wq0.1 | 16 B | 0 | 1.19 µs | 1.61 µs | 1.43 / 1.73 / 1.91 µs | 21 / 10000 | 2 ns (−6 / 5) | 0 / 0 |
+| wq0.1 | 4 KiB | 0 | 1.17 µs | 2.14 µs | 2.06 / 2.28 / 3.15 µs | 5 / 10000 | −2 ns (−6 / 6) | 0 / 0 |
+| wq0.1 | 64 KiB | 0 | 1.24 µs | 7.87 µs | 7.59 / 8.25 / 9.52 µs | 1 / 10000 | 2 ns (−6 / 6) | 1 / 1 |
+| wq0.1 | 4 KiB | 100 µs | 1.28 µs | 3.24 µs | 3.06 / 3.51 / 4.99 µs | 0 / 200 | 2 ns (−6 / 6) | 0 / 0 |
+| wq0.1 | 4 KiB | 1 ms | 1.71 µs | 3.73 µs | 2.88 / 4.29 / 5.15 µs | 0 / 200 | −5 ns (−6 / 7) | 0 / 1 |
+| wq0.1 | 4 KiB | 10 ms | 3.12 µs | 4.20 µs | 3.46 / 6.03 / 9.58 µs | 5 / 200 | 3 ns (−6 / 6) | 25 / 2 |
+| wq0.1 | 4 KiB | 100 ms | 5.75 µs | 6.21 µs | 5.34 / 7.35 / 71.2 µs | 32 / 200 | 5 ns (−7 / 7) | 77 / 10 |
+| wq0.0 | 16 B | 0 | 1.41 µs | 1.63 µs | 1.56 / 1.72 / 1.86 µs | 480 / 10000 | −3 ns (−7 / 7) | 11 / 11 |
+| wq0.0 | 4 KiB | 0 | 1.35 µs | 3.48 µs | 3.31 / 3.64 / 3.91 µs | 5 / 10000 | −2 ns (−6 / 6) | 0 / 1 |
+| wq0.0 | 64 KiB | 0 | 1.38 µs | 8.14 µs | 7.76 / 8.66 / 9.41 µs | 1 / 10000 | 2 ns (−6 / 6) | 0 / 5 |
+| wq0.0 | 4 KiB | 100 µs | 1.41 µs | 3.03 µs | 2.80 / 3.22 / 7.92 µs | 0 / 200 | −4 ns (−7 / 6) | 7 / 1 |
+| wq0.0 | 4 KiB | 1 ms | 1.89 µs | 3.58 µs | 3.20 µs / 5.65 µs / 2.99 ms | 0 / 200 | −4 ns (−7 / 6) | 1 / 12 |
+| wq0.0 | 4 KiB | 10 ms | 3.82 µs | 4.78 µs | 3.83 / 5.70 / 10.2 µs | 10 / 200 | 3 ns (−6 / 6) | 8 / 2 |
+| wq0.0 | 4 KiB | 100 ms | 6.80 µs | 7.16 µs | 5.82 / 10.1 / 95.8 µs | 90 / 200 | 6 ns (−7 / 153) | 237 / 30 |
+
+- The submit with `write()` is 1.17-1.41 µs (QAT `io_submit`: 7.68-8.55 µs).
+  The portal instruction would remove the system call, but on this DSA only
+  a process with `CAP_SYS_RAWIO` can map the portal.
+- An offload costs about 2.1-3.5 µs at 4 KiB and then about 0.08-0.10 µs a
+  KiB (QAT: about 1.1 µs a KiB), one descriptor at a time.
+- At 16 B the byte is set 0.42 µs (dedicated) or 0.22 µs (shared) after
+  `write()` returns, and on the shared WQ it is set before `write()`
+  returns in 480 of 10,000 runs. The device starts inside `write()`, so the
+  device and the record write take between this time and the offload
+  (1.61-1.63 µs). The device gives no time stamp, so the time is not
+  measured.
+- At 4 KiB the shared WQ is 1.34 µs slower than the dedicated WQ, but at
+  16 B and 64 KiB the two are within 0.27 µs. Both WQs are in `group0.0`
+  with `engine0.0` and priority 10; only the WQ threshold is different (31
+  vs. 0). The cause is not measured.
+- After 100 ms of device idle the submit is 4.6-5.5 µs slower, and the
+  offload is 3.7-4.1 µs slower, so the device adds no time of its own (QAT:
+  30 µs more after 10 ms, from the power state of the device). The cause of
+  the slow submit is not measured: the `write()` path is not in the caches
+  and the TLB after the sleep, and other jobs ran on CPU 2 during the sleep
+  (77-237 filler switches).
+- On the SMT sibling the floor is −7 to 7 ns (p10 / p90) in all rows but
+  the shared WQ after 100 ms of idle (p90 153 ns, 237 filler switches): the
+  filler CPU sees the byte at the same time as the observer. So the detect
+  times below start when the byte gets to the filler core.
+
+#### Latency
+
+`dsa-latency` on the dedicated WQ (`wq0.1`), 1000 runs. The offload starts
+with the filler, so the device sets the completion time. Detect, switch,
+latency and the switch counts are at interval 200. There is no kernel write,
+so there is no observer lag to add: the latency is from the byte at the
+filler core.
+
+| Filler | Runtime (off) | Offload median | Yields 0 / 200 | Detect median / p99 | Switch median / p99 | Latency median / p99 | Latency off median | Switches filler / observer |
+|---|---|---|---|---|---|---|---|---|
+| `deserialize` | 61.9 µs | 4.62 µs | 1000 / 1000 | 59.9 / 66.3 µs | 45 / 80 ns | 59.9 / 66.3 µs | 60.0 µs | 1 / 1 |
+| `serialize` | 38.1 µs | 4.14 µs | 17 / 115 | 40.0 / 47.4 µs | 99 / 120 ns | 40.1 / 47.5 µs | 37.9 µs | 4 / 2 |
+| `decrypt` | 81.2 µs | 4.63 µs | 8 / 41 | 87.8 / 98.8 µs | 107 / 129 ns | 87.9 / 98.9 µs | 81.0 µs | 2 / 2 |
+| `decrypt-chunked` | 91.2 µs | 4.41 µs | 1000 / 1000 | 386 ns / 1.31 µs | 34 / 51 ns | 420 ns / 1.35 µs | 90.6 µs | 19 / 1 |
+| `matmul` | 69.45 ms | 6.66 µs | 1000 / 1000 | 11 / 307 ns | 35 / 162 ns | 48 / 400 ns | 67.52 ms | 186 / 132 |
+| `histogram` | 465.6 µs | 3.49 µs | 1000 / 1000 | 11 / 40 ns | 31 / 78 ns | 42 / 88 ns | 453.5 µs | 2 / 0 |
+| `dotproduct` | 391.6 µs | 3.54 µs | 1000 / 1000 | 9 / 31 ns | 31 / 49 ns | 39 / 66 ns | 386.8 µs | 0 / 0 |
+| `gather` | 218.9 µs | 5.71 µs | 1000 / 1000 | 37 / 198 ns | 41 / 132 ns | 78 / 251 ns | 216.9 µs | 4 / 0 |
+| `scatter-update` | 352.9 µs | 5.07 µs | 1000 / 1000 | 46 / 302 ns | 37 / 159 ns | 125 / 358 ns | 366.4 µs | 3 / 0 |
+| `hash` | 194.7 µs | 3.79 µs | 1000 / 1000 | 8 / 15 ns | 31 / 35 ns | 39 / 46 ns | 187.3 µs | 0 / 0 |
+| `sequential-writer` | 12.0 µs | 3.92 µs | 1000 / 1000 | 10 / 116 ns | 38 / 400 ns | 49 / 450 ns | 10.8 µs | 3 / 0 |
+
+The dense kernels (`matmul`, `histogram`, `dotproduct`, `gather`,
+`scatter-update`, `hash`, `sequential-writer`) on the two WQs, with the
+switch counts summed over the 7 kernels:
+
+| WQ | Interval | Submit / offload median, 4 KiB | Detect median | Switch median | Latency median | Latency p99 | Switches filler / observer |
+|---|---|---|---|---|---|---|---|
+| wq0.1, dedicated | 200 | 1.17 / 2.14 µs | 8-46 ns | 31-41 ns | 39-125 ns | 46-450 ns | 198 / 132 |
+| wq0.1, dedicated | 0 | 1.17 / 2.14 µs | 7-39 ns | 30-39 ns | 38-78 ns | 47-399 ns | 349 / 352 |
+| wq0.0, shared | 200 | 1.35 / 3.48 µs | 7-35 ns | 31-39 ns | 37-72 ns | 48-444 ns | 163 / 104 |
+| wq0.0, shared | 0 | 1.35 / 3.48 µs | 6-36 ns | 31-43 ns | 38-78 ns | 54-566 ns | 203 / 437 |
+
+- Where the probe points are dense, the program switches 37-125 ns median
+  after the byte gets to its core: 7-46 ns to the next probe point and
+  31-41 ns to switch. The detect and the switch are those of QAT (15-52 and
+  39-56 ns), but there is no kernel path before them (QAT: 3.13 µs from the
+  interrupt to the kernel write) and no cache-line move from an interrupt
+  CPU (QAT: 192 ns of the 247-298 ns from the write).
+- The emulated accelerator on the SMT sibling gives 109-146 ns with a floor
+  of 62 ns: 47-84 ns without the floor, as the DSA latency. Its times start
+  at the write of the byte on the sibling CPU, so they include the floor.
+  The DSA times start when the byte gets to the filler core: the write of
+  the record from the device to the core is not measured.
+- `gather` and `scatter-update` detect in 34-46 ns, the other kernels in
+  7-11 ns, as with QAT. On `wq0.1` the `scatter-update` detect has two modes
+  (p25 37 ns, p75 125 ns), so its latency median (125 ns) is more than the
+  detect and switch medians. The cause is not measured.
+- A p99 above 250 ns comes with a switch p99 of 130-400 ns and with
+  involuntary switches: `matmul` (69 ms a run) has 149-186 filler switches
+  in 1000 runs, `hash` on `wq0.0` has a switch p99 of 394 ns and
+  `sequential-writer` on `wq0.1` 400 ns. These are other jobs on the CPUs.
+- `decrypt-chunked` detects in 386-494 ns median, p99 1.3 µs (QAT: 129 ns).
+  The cause is not measured.
+- `deserialize` yields only after the `bytes` copy, as with QAT. `serialize`
+  yields in 11-115 and `decrypt` in 8-113 of 1000 runs (QAT: 0). The DSA
+  offload ends after about 4 µs, not 21 µs; a likely cause is that the byte
+  is set while the filler is still in probed set-up code. This cause is not
+  verified.
+- The offload median is 2.5-6.9 µs (`dsa-floor` at 4 KiB: 2.1-3.5 µs). It
+  is 4.1-5.7 µs next to `deserialize`, `serialize`, `decrypt`, `gather` and
+  `scatter-update`, and 6.7-6.9 µs next to `matmul` (69 ms a run), as after
+  100 ms of idle in `dsa-floor`. The cause is not measured.
+- `sequential-writer` (12 µs) yields in all runs: the 4 µs offload ends
+  before the filler (QAT: the filler ends before the device in 26 % of the
+  runs).
+- A run on an idle host would remove most of the switches and the high p99
+  values.
+
 ## Limits
 
 - **Code with no loops in IR gets no probes.** The pass probes loop headers
@@ -614,8 +821,7 @@ observer saw the byte outside the gap).
   the completion byte: the kernel does, in the interrupt of the device. So the
   QAT detect time includes a cache-line transfer from the interrupt CPU, as
   with the emulated accelerator. DSA and IAA write a completion record from
-  the device, but they need an administrator: see
-  [Why QAT](#why-qat-and-not-dsa-or-iaa). The RACER applications in `src/` are
+  the device: see [DSA accelerator](#dsa-accelerator). The RACER applications in `src/` are
   not yet linked to these probed builds.
 - **Use idle CPUs for the bench.** On a loaded host, `late_completions` rises
   and the latency includes the delay of the accelerator thread.

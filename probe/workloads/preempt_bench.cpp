@@ -1,5 +1,5 @@
 // preempt_bench: probe-point accelerator preemption with an emulated
-// accelerator and with an Intel QAT device.
+// accelerator, with an Intel QAT device and with an Intel DSA device.
 //
 // This file is the application and is not probed. The fillers it runs call
 // probed code: the RACER kernels, protobuf (with the generated router.pb.cc)
@@ -35,11 +35,19 @@
 //                 the CPU of the QAT interrupt: the filler CPU loads the
 //                 completion byte and reads the TSC in a tight loop, and a
 //                 long step between two TSC reads is the interrupt.
+//   dsa-latency   qat-latency with a DSA device: the offload is a memory move
+//                 through a user work queue, and the completion byte is the
+//                 status byte of the completion record that the device
+//                 writes. No kernel code is on the completion path.
+//   dsa-floor     qat-floor with the DSA device of dsa-latency.
+#include <fcntl.h>
 #include <getopt.h>
 #include <linux/aio_abi.h>
+#include <linux/idxd.h>
 #include <linux/if_alg.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -57,6 +65,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -732,6 +741,9 @@ constexpr unsigned kernel_aio_ring_magic = 0xa10a10a1;
 // checked against code that is not the kernel's or the device's.
 class QatDecryptOffload {
  public:
+  // The /proc/interrupts lines of the device hold this name.
+  static constexpr const char *interrupt_name = "qat";
+
   QatDecryptOffload(size_t offload_bytes, std::mt19937_64 &random)
       : offload_bytes(offload_bytes),
         plaintext(random_bytes(offload_bytes, random)),
@@ -837,6 +849,198 @@ class QatDecryptOffload {
   KernelAioRing *ring = nullptr;
 };
 
+// ---------------------------------------------------------------------------
+// DSA accelerator
+//
+// An Intel DSA device moves memory through a user work queue (WQ). The program
+// gives a 64-byte descriptor to the WQ of /dev/dsa/wqD.Q, and the device writes
+// a 32-byte completion record when it is done. The device works on the virtual
+// addresses of the program (shared virtual memory through the PASID of the
+// process). No kernel code and no interrupt are on the completion path: the
+// status byte of the completion record is the completion byte that the probe
+// points load. An administrator makes and enables the WQ with accel-config and
+// gives the users access to its device file.
+//
+// The program writes the descriptor to the mapped WQ portal with one
+// instruction. On a device with the user-submission erratum of the first DSA
+// (Sapphire Rapids, CVE-2024-21823), the idxd driver lets only a process with
+// CAP_SYS_RAWIO map the portal; the others give the descriptor with write() on
+// the device file, and the driver checks it and writes it to the portal. That
+// adds a system call to the submit, but not to the completion.
+
+// Returns the first word of a file, such as the mode of a WQ in sysfs.
+static std::string read_first_word(const std::string &path) {
+  std::ifstream file(path);
+  std::string word;
+  if (!(file >> word)) {
+    fprintf(stderr, "cannot read %s\n", path.c_str());
+    exit(1);
+  }
+  return word;
+}
+
+// One memory move at a time on a DSA WQ. Through the portal, a dedicated WQ
+// takes the descriptor with MOVDIR64B, and a shared WQ with ENQCMD, which
+// returns "retry" when the WQ is full. Each output is checked against the
+// source.
+class DsaMemmoveOffload {
+ public:
+  // The /proc/interrupts lines of the device hold this name.
+  static constexpr const char *interrupt_name = "idxd";
+  // How the program gives the descriptor to the WQ.
+  enum class Submission { portal_instruction, write_system_call };
+
+  DsaMemmoveOffload(const std::string &work_queue_path, size_t offload_bytes,
+                    std::mt19937_64 &random)
+      : source(random_bytes(offload_bytes, random)),
+        destination(offload_bytes),
+        record_slots(record_slot_count) {
+    std::string work_queue_name = work_queue_path.substr(work_queue_path.rfind('/') + 1);
+    std::string sysfs_directory = "/sys/bus/dsa/devices/" + work_queue_name + "/";
+    shared_work_queue = read_first_word(sysfs_directory + "mode") == "shared";
+    bool block_on_fault = read_first_word(sysfs_directory + "block_on_fault") == "1";
+    size_t max_transfer_bytes = std::stoull(read_first_word(sysfs_directory + "max_transfer_size"));
+    if (offload_bytes > max_transfer_bytes) {
+      fprintf(stderr, "--offload-bytes %zu is more than the %zu bytes that %s moves at most\n",
+              offload_bytes, max_transfer_bytes, work_queue_name.c_str());
+      exit(1);
+    }
+    work_queue_fd = open(work_queue_path.c_str(), O_RDWR);
+    if (work_queue_fd < 0) {
+      fprintf(stderr, "cannot open the DSA WQ %s: %s\n", work_queue_path.c_str(), strerror(errno));
+      exit(1);
+    }
+    portal = mmap(nullptr, portal_bytes, PROT_WRITE, MAP_SHARED | MAP_POPULATE, work_queue_fd, 0);
+    if (portal != MAP_FAILED) {
+      submission = Submission::portal_instruction;
+    } else if (errno == EPERM) {
+      portal = nullptr;
+      submission = Submission::write_system_call;
+      fprintf(stderr,
+              "the idxd driver does not let this process map the portal of %s "
+              "(no CAP_SYS_RAWIO on a device with the user-submission erratum); "
+              "the submit is a write() system call\n",
+              work_queue_name.c_str());
+    } else {
+      exit_with_system_error("mmap of the DSA WQ portal");
+    }
+    descriptor.opcode = DSA_OPCODE_MEMMOVE;
+    // CRAV: completion_addr is valid. RCR: write a completion record. BOF: on
+    // a page fault, wait for the kernel to map the page (when the WQ allows it).
+    descriptor.flags =
+        IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | (block_on_fault ? IDXD_OP_FLAG_BOF : 0);
+    descriptor.src_addr = reinterpret_cast<uint64_t>(source.data());
+    descriptor.dst_addr = reinterpret_cast<uint64_t>(destination.data());
+    descriptor.xfer_size = static_cast<uint32_t>(offload_bytes);
+    // One offload checks that the WQ takes the descriptor and that the device
+    // moves the bytes.
+    prepare();
+    submit();
+    if (!reap()) {
+      fprintf(stderr, "the DSA offload failed: completion status 0x%02x\n", last_status);
+      exit(1);
+    }
+  }
+  ~DsaMemmoveOffload() {
+    if (portal != nullptr) {
+      munmap(portal, portal_bytes);
+    }
+    close(work_queue_fd);
+  }
+  DsaMemmoveOffload(const DsaMemmoveOffload &) = delete;
+  DsaMemmoveOffload &operator=(const DsaMemmoveOffload &) = delete;
+
+  // Clears the destination and the completion record of the next offload, and
+  // returns the status byte of the record. The device sets it to 1 (success)
+  // or to an error code. Each offload has its own record line, as in
+  // CompletionRecordPool.
+  volatile uint8_t *prepare() {
+    std::fill(destination.begin(), destination.end(), 0);
+    current_record = &record_slots[next_record_slot].record;
+    next_record_slot = (next_record_slot + 1) % record_slot_count;
+    memset(current_record, 0, sizeof *current_record);
+    descriptor.completion_addr = reinterpret_cast<uint64_t>(current_record);
+    return &current_record->status;
+  }
+  // Gives the descriptor to the WQ: one instruction to the portal, or one
+  // write() system call.
+  void submit() {
+    if (submission == Submission::write_system_call) {
+      submit_with_write_system_call();
+      return;
+    }
+    // The fence makes the cleared record and destination visible to the device
+    // first.
+    _mm_sfence();
+    if (!shared_work_queue) {
+      _movdir64b(portal, &descriptor);
+      return;
+    }
+    int rejections = 0;
+    while (_enqcmd(portal, &descriptor) != 0) {
+      if (++rejections == max_enqcmd_rejections) {
+        fprintf(stderr, "the shared DSA WQ rejected the descriptor %d times\n", rejections);
+        exit(1);
+      }
+      _mm_pause();
+    }
+  }
+  // Waits for the completion record of the offload (at most 1 s) and returns
+  // true when the status is success and the destination holds the source.
+  bool reap() {
+    double deadline_ns = monotonic_ns() + 1e9;
+    while (current_record->status == 0) {
+      if (monotonic_ns() > deadline_ns) {
+        fprintf(stderr, "the DSA offload did not complete in 1 s\n");
+        exit(1);
+      }
+      _mm_pause();
+    }
+    last_status = DSA_COMP_STATUS(current_record->status);
+    return last_status == DSA_COMP_SUCCESS && destination == source;
+  }
+
+ private:
+  // The driver writes the descriptor to the portal. For a shared WQ it
+  // retries ENQCMD a few times and then returns EAGAIN.
+  void submit_with_write_system_call() {
+    int rejections = 0;
+    while (write(work_queue_fd, &descriptor, sizeof descriptor) !=
+           static_cast<ssize_t>(sizeof descriptor)) {
+      if (errno != EAGAIN) {
+        exit_with_system_error("write of the DSA descriptor");
+      }
+      if (++rejections == max_enqcmd_rejections) {
+        fprintf(stderr, "the shared DSA WQ rejected the descriptor %d times\n", rejections);
+        exit(1);
+      }
+    }
+  }
+
+  static constexpr size_t portal_bytes = 4096;
+  static constexpr int record_slot_count = 1024;
+  static constexpr int max_enqcmd_rejections = 1000000;
+  struct alignas(64) CompletionRecordSlot {
+    dsa_completion_record record;
+  };
+
+  std::vector<uint8_t> source;
+  std::vector<uint8_t> destination;
+  std::vector<CompletionRecordSlot> record_slots;
+  int next_record_slot = 0;
+  dsa_completion_record *current_record = nullptr;
+  alignas(64) dsa_hw_desc descriptor = {};
+  bool shared_work_queue = false;
+  int work_queue_fd = -1;
+  void *portal = nullptr;
+  Submission submission = Submission::portal_instruction;
+  uint8_t last_status = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Device completions: the observer, the device interrupts and the context
+// switches of the threads, for the QAT and DSA modes
+
 // A thread on its own CPU that records when a completion byte becomes
 // nonzero. The device gives no time stamp of its completion, so the time the
 // observer sees the byte stands for the completion time. The observer loads the
@@ -865,12 +1069,20 @@ class CompletionObserver {
     state.store(State::idle, std::memory_order_relaxed);
     return completion_seen_tsc;
   }
+  // The kernel thread id of the observer thread.
+  pid_t thread_id() const {
+    while (observer_thread_id.load(std::memory_order_acquire) == 0) {
+      _mm_pause();
+    }
+    return observer_thread_id.load(std::memory_order_acquire);
+  }
 
  private:
   enum class State { idle, watch_requested, watching, completion_seen };
 
   void observe(int cpu) {
     pin_current_thread_to_cpu(cpu);
+    observer_thread_id.store(gettid(), std::memory_order_release);
     while (!stop_requested.load(std::memory_order_acquire)) {
       if (state.load(std::memory_order_acquire) != State::watch_requested) {
         _mm_pause();
@@ -889,12 +1101,13 @@ class CompletionObserver {
   uint64_t completion_seen_tsc = 0;          // written before completion_seen
   std::atomic<State> state{State::idle};
   std::atomic<bool> stop_requested{false};
+  std::atomic<pid_t> observer_thread_id{0};
   std::thread observer_thread;  // Last, so that it starts after the atomics exist.
 };
 
-// The interrupts of the QAT devices that each CPU has handled, from
-// /proc/interrupts: the sum over the lines whose names hold "qat".
-static std::map<int, uint64_t> read_qat_interrupts_per_cpu() {
+// The interrupts of a kind of device that each CPU has handled, from
+// /proc/interrupts: the sum over the lines whose names hold name_part.
+static std::map<int, uint64_t> read_device_interrupts_per_cpu(const char *name_part) {
   std::ifstream interrupts_file("/proc/interrupts");
   std::string line;
   std::getline(interrupts_file, line);
@@ -906,7 +1119,7 @@ static std::map<int, uint64_t> read_qat_interrupts_per_cpu() {
   }
   std::map<int, uint64_t> interrupts_per_cpu;
   while (std::getline(interrupts_file, line)) {
-    if (line.find("qat") == std::string::npos) {
+    if (line.find(name_part) == std::string::npos) {
       continue;
     }
     std::istringstream fields(line);
@@ -921,15 +1134,15 @@ static std::map<int, uint64_t> read_qat_interrupts_per_cpu() {
   return interrupts_per_cpu;
 }
 
-struct QatInterrupts {
+struct DeviceInterrupts {
   uint64_t total = 0;
   int busiest_cpu = -1;  // the CPU that handled the most of them
   uint64_t busiest_cpu_count = 0;
 };
 
-static QatInterrupts qat_interrupts_between(const std::map<int, uint64_t> &before,
-                                            const std::map<int, uint64_t> &after) {
-  QatInterrupts interrupts;
+static DeviceInterrupts device_interrupts_between(const std::map<int, uint64_t> &before,
+                                                  const std::map<int, uint64_t> &after) {
+  DeviceInterrupts interrupts;
   for (const auto &[cpu, count_after] : after) {
     auto count_before = before.find(cpu);
     uint64_t count = count_after - (count_before == before.end() ? 0 : count_before->second);
@@ -941,6 +1154,46 @@ static QatInterrupts qat_interrupts_between(const std::map<int, uint64_t> &befor
   }
   return interrupts;
 }
+
+// The involuntary context switches of a thread of this process so far: the
+// times the kernel took its CPU to run another thread.
+static uint64_t read_involuntary_context_switches(pid_t thread_id) {
+  std::ifstream status_file("/proc/self/task/" + std::to_string(thread_id) + "/status");
+  const std::string field = "nonvoluntary_ctxt_switches:";
+  std::string line;
+  while (std::getline(status_file, line)) {
+    if (line.compare(0, field.size(), field) == 0) {
+      return std::stoull(line.substr(field.size()));
+    }
+  }
+  fprintf(stderr, "no %s in the status of thread %d\n", field.c_str(), thread_id);
+  exit(1);
+}
+
+// Counts the involuntary context switches of the filler thread (the thread
+// that makes the counter) and of the observer thread from the construction of
+// the counter. They are 0 when nothing else runs on the two CPUs. On a busy
+// host, a run with a switch has a long time.
+class InvoluntarySwitchCounter {
+ public:
+  explicit InvoluntarySwitchCounter(const CompletionObserver &observer)
+      : filler_thread_id(gettid()),
+        observer_thread_id(observer.thread_id()),
+        filler_switches_at_start(read_involuntary_context_switches(filler_thread_id)),
+        observer_switches_at_start(read_involuntary_context_switches(observer_thread_id)) {}
+  uint64_t filler_switches() const {
+    return read_involuntary_context_switches(filler_thread_id) - filler_switches_at_start;
+  }
+  uint64_t observer_switches() const {
+    return read_involuntary_context_switches(observer_thread_id) - observer_switches_at_start;
+  }
+
+ private:
+  pid_t filler_thread_id;
+  pid_t observer_thread_id;
+  uint64_t filler_switches_at_start;
+  uint64_t observer_switches_at_start;
+};
 
 // ---------------------------------------------------------------------------
 // Filler fiber
@@ -1047,33 +1300,35 @@ static PreemptedRun run_filler_with_offload(Filler &filler, FillerFiber &fiber,
   return run;
 }
 
-struct QatPreemptedRun {
+struct DeviceOffloadRun {
   RunOutcome outcome;
-  // The time of the scheduler in sendmsg and io_submit.
+  // The time of the scheduler in the submit: sendmsg and io_submit for QAT,
+  // the fence and the portal write for DSA.
   int64_t submit_ticks;
-  // From the start of the submit to the observer seeing the completion byte:
-  // the copy into the kernel, the device, its interrupt and the kernel
-  // completion.
+  // From the start of the submit to the observer seeing the completion byte.
+  // QAT: the copy into the kernel, the device, its interrupt and the kernel
+  // completion. DSA: the device and its completion record write.
   int64_t offload_ticks;
   // From the observer seeing the completion byte to the filler stop. Can be
-  // negative for a yield: qat-floor measures the offset between the filler CPU
-  // and the observer CPU in seeing the byte.
+  // negative for a yield: qat-floor and dsa-floor measure the offset between
+  // the filler CPU and the observer CPU in seeing the byte.
   int64_t detect_ticks;
   // From the filler stop to the scheduler running again.
   int64_t switch_ticks;
-  // The completion byte was set when io_submit returned. When this is so on
-  // each run, the kernel does the decrypt in the submit and not on the device
-  // in the background; on a few runs it only means that the submit was slow.
+  // The completion byte was set when the submit returned. When this is so on
+  // each run, the offload is done in the submit and not on the device in the
+  // background; on a few runs it only means that the submit was slow.
   bool completed_during_submit;
   bool output_correct;
   bool offload_output_correct;
 };
 
-// run_filler_with_offload with a QAT offload in flight.
-static QatPreemptedRun run_filler_with_qat_offload(Filler &filler, FillerFiber &fiber,
-                                                   QatDecryptOffload &offload,
-                                                   CompletionObserver &observer,
-                                                   uint64_t reference_checksum) {
+// run_filler_with_offload with a QAT or DSA offload in flight.
+template <typename DeviceOffload>
+static DeviceOffloadRun run_filler_with_device_offload(Filler &filler, FillerFiber &fiber,
+                                                       DeviceOffload &offload,
+                                                       CompletionObserver &observer,
+                                                       uint64_t reference_checksum) {
   filler.reset();
   volatile uint8_t *completion_byte = offload.prepare();
   observer.watch(completion_byte);
@@ -1097,7 +1352,7 @@ static QatPreemptedRun run_filler_with_qat_offload(Filler &filler, FillerFiber &
   bool offload_output_correct = offload.reap();
   uint64_t completion_seen_tsc = observer.wait_for_completion_tsc();
 
-  QatPreemptedRun run;
+  DeviceOffloadRun run;
   run.submit_ticks = static_cast<int64_t>(submit_end_tsc - submit_start_tsc);
   run.offload_ticks = static_cast<int64_t>(completion_seen_tsc - submit_start_tsc);
   run.detect_ticks = static_cast<int64_t>(stopped_tsc - completion_seen_tsc);
@@ -1127,6 +1382,7 @@ struct Options {
   int accelerator_cpu = 4;
   int observer_cpu = 6;
   size_t offload_bytes = 4096;
+  std::string work_queue_path = "/dev/dsa/wq0.1";
   double idle_us = 0;
   double offload_ns = 0;  // 0: the default of the mode
   uint64_t seed = 1;
@@ -1302,9 +1558,11 @@ static void measure_signal_floor(const Options &options, const TscClock &clock,
          percentile(floors_ns, 1.0));
 }
 
-static void measure_qat_latency(const char *filler_name, Filler &filler, const Options &options,
-                                const TscClock &clock, QatDecryptOffload &offload,
-                                CompletionObserver &observer, FILE *samples) {
+// qat-latency and dsa-latency.
+template <typename DeviceOffload>
+static void measure_device_latency(const char *filler_name, Filler &filler, const Options &options,
+                                   const TscClock &clock, DeviceOffload &offload,
+                                   CompletionObserver &observer, FILE *samples) {
   uint64_t reference_checksum = warm_up(filler);
   int wrong_outputs = 0;
   double filler_median_ns =
@@ -1312,7 +1570,7 @@ static void measure_qat_latency(const char *filler_name, Filler &filler, const O
 
   FillerFiber fiber;
   for (int run_index = 0; run_index < warmup_runs; run_index++) {
-    run_filler_with_qat_offload(filler, fiber, offload, observer, reference_checksum);
+    run_filler_with_device_offload(filler, fiber, offload, observer, reference_checksum);
   }
   int run_counts[3] = {};
   int failed_offloads = 0;
@@ -1323,10 +1581,12 @@ static void measure_qat_latency(const char *filler_name, Filler &filler, const O
   std::vector<double> latencies_ns;
   std::vector<double> detects_ns;
   std::vector<double> switches_ns;
-  std::map<int, uint64_t> interrupts_before = read_qat_interrupts_per_cpu();
+  std::map<int, uint64_t> interrupts_before =
+      read_device_interrupts_per_cpu(DeviceOffload::interrupt_name);
+  InvoluntarySwitchCounter involuntary_switches(observer);
   for (int run_index = 0; run_index < options.runs; run_index++) {
-    QatPreemptedRun run =
-        run_filler_with_qat_offload(filler, fiber, offload, observer, reference_checksum);
+    DeviceOffloadRun run =
+        run_filler_with_device_offload(filler, fiber, offload, observer, reference_checksum);
     run_counts[static_cast<int>(run.outcome)]++;
     if (!run.output_correct) {
       wrong_outputs++;
@@ -1357,9 +1617,11 @@ static void measure_qat_latency(const char *filler_name, Filler &filler, const O
               run.offload_output_correct ? 1 : 0);
     }
   }
-  QatInterrupts interrupts =
-      qat_interrupts_between(interrupts_before, read_qat_interrupts_per_cpu());
-  printf("qat-latency,%s,%s,%s,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64,
+  uint64_t filler_involuntary_switches = involuntary_switches.filler_switches();
+  uint64_t observer_involuntary_switches = involuntary_switches.observer_switches();
+  DeviceInterrupts interrupts = device_interrupts_between(
+      interrupts_before, read_device_interrupts_per_cpu(DeviceOffload::interrupt_name));
+  printf("%s,%s,%s,%s,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64, options.mode.c_str(),
          RACER_PROBE_INTERVAL, options.ipp_code_path.c_str(), filler_name, options.size_bytes,
          options.offload_bytes, options.runs, run_counts[static_cast<int>(RunOutcome::yielded)],
          run_counts[static_cast<int>(RunOutcome::finished_after_completion)],
@@ -1374,18 +1636,21 @@ static void measure_qat_latency(const char *filler_name, Filler &filler, const O
          percentile(detects_ns, 0.99));
   printf(",%.0f,%.0f,%.0f", percentile(switches_ns, 0.5), percentile(switches_ns, 0.9),
          percentile(switches_ns, 0.99));
-  printf(",%.0f\n", filler_median_ns);
+  printf(",%.0f,%" PRIu64 ",%" PRIu64 "\n", filler_median_ns, filler_involuntary_switches,
+         observer_involuntary_switches);
 }
 
-// The least detect time of qat-latency. With no filler and no fiber, the filler
-// CPU loads the completion byte in a tight loop, as the observer does. The time
-// from the observer seeing the byte to the filler CPU seeing it is the offset
-// between the two CPUs: the difference of their cache-line transfers from the
-// CPU of the interrupt, plus any TSC offset. Before each offload, the device
-// is idle for --idle-us: the offload time depends on how long the device was
-// idle.
-static void measure_qat_floor(const Options &options, const TscClock &clock,
-                              QatDecryptOffload &offload, CompletionObserver &observer) {
+// The least detect time of qat-latency and dsa-latency. With no filler and no
+// fiber, the filler CPU loads the completion byte in a tight loop, as the
+// observer does. The time from the observer seeing the byte to the filler CPU
+// seeing it is the offset between the two CPUs: the difference of their
+// cache-line transfers from the writer of the byte (the CPU of the QAT
+// interrupt, or the DSA device), plus any TSC offset. Before each offload, the
+// device is idle for --idle-us: the offload time depends on how long the
+// device was idle.
+template <typename DeviceOffload>
+static void measure_device_floor(const Options &options, const TscClock &clock,
+                                 DeviceOffload &offload, CompletionObserver &observer) {
   std::vector<double> submits_ns;
   std::vector<double> offloads_ns;
   std::vector<double> floors_ns;
@@ -1393,9 +1658,11 @@ static void measure_qat_floor(const Options &options, const TscClock &clock,
   int completed_during_submit_count = 0;
   uint64_t idle_ticks = static_cast<uint64_t>(clock.ns_to_ticks(options.idle_us * 1000));
   std::map<int, uint64_t> interrupts_before;
+  std::optional<InvoluntarySwitchCounter> involuntary_switches;
   for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
     if (run_index == warmup_runs) {
-      interrupts_before = read_qat_interrupts_per_cpu();
+      interrupts_before = read_device_interrupts_per_cpu(DeviceOffload::interrupt_name);
+      involuntary_switches.emplace(observer);
     }
     volatile uint8_t *completion_byte = offload.prepare();
     observer.watch(completion_byte);
@@ -1426,18 +1693,20 @@ static void measure_qat_floor(const Options &options, const TscClock &clock,
     floors_ns.push_back(clock.ticks_to_ns(
         static_cast<double>(static_cast<int64_t>(seen_tsc - completion_seen_tsc))));
   }
-  QatInterrupts interrupts =
-      qat_interrupts_between(interrupts_before, read_qat_interrupts_per_cpu());
-  printf("qat-floor,%d,%d,%zu,%g,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64, options.cpu,
+  uint64_t filler_involuntary_switches = involuntary_switches->filler_switches();
+  uint64_t observer_involuntary_switches = involuntary_switches->observer_switches();
+  DeviceInterrupts interrupts = device_interrupts_between(
+      interrupts_before, read_device_interrupts_per_cpu(DeviceOffload::interrupt_name));
+  printf("%s,%d,%d,%zu,%g,%d,%d,%d,%" PRIu64 ",%d,%" PRIu64, options.mode.c_str(), options.cpu,
          options.observer_cpu, options.offload_bytes, options.idle_us, options.runs,
-         failed_offloads,
-         completed_during_submit_count, interrupts.total, interrupts.busiest_cpu,
+         failed_offloads, completed_during_submit_count, interrupts.total, interrupts.busiest_cpu,
          interrupts.busiest_cpu_count);
   printf(",%.0f,%.0f", percentile(submits_ns, 0.5), percentile(submits_ns, 0.99));
   printf(",%.0f,%.0f,%.0f,%.0f", percentile(offloads_ns, 0.5), percentile(offloads_ns, 0.1),
          percentile(offloads_ns, 0.9), percentile(offloads_ns, 0.99));
-  printf(",%.0f,%.0f,%.0f,%.0f\n", percentile(floors_ns, 0.5), percentile(floors_ns, 0.1),
+  printf(",%.0f,%.0f,%.0f,%.0f", percentile(floors_ns, 0.5), percentile(floors_ns, 0.1),
          percentile(floors_ns, 0.9), percentile(floors_ns, 0.99));
+  printf(",%" PRIu64 ",%" PRIu64 "\n", filler_involuntary_switches, observer_involuntary_switches);
 }
 
 static void print_median_and_tail(const std::vector<double> &values_ns) {
@@ -1493,7 +1762,7 @@ static void measure_qat_interrupt(const Options &options, const TscClock &clock,
   std::map<int, uint64_t> interrupts_before;
   for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
     if (run_index == warmup_runs) {
-      interrupts_before = read_qat_interrupts_per_cpu();
+      interrupts_before = read_device_interrupts_per_cpu(QatDecryptOffload::interrupt_name);
     }
     volatile uint8_t *completion_byte = offload.prepare();
     observer.watch(completion_byte);
@@ -1555,8 +1824,9 @@ static void measure_qat_interrupt(const Options &options, const TscClock &clock,
     seens_to_return_ns.push_back(ns_between(completion_seen_tsc, last_gap_end_tsc));
     gaps_ns.push_back(ns_between(last_gap_start_tsc, last_gap_end_tsc));
   }
-  std::map<int, uint64_t> interrupts_after = read_qat_interrupts_per_cpu();
-  QatInterrupts interrupts = qat_interrupts_between(interrupts_before, interrupts_after);
+  std::map<int, uint64_t> interrupts_after =
+      read_device_interrupts_per_cpu(QatDecryptOffload::interrupt_name);
+  DeviceInterrupts interrupts = device_interrupts_between(interrupts_before, interrupts_after);
   uint64_t filler_cpu_interrupts = interrupts_after[options.cpu] - interrupts_before[options.cpu];
   // Each completion is one interrupt of the response ring. With fewer on the
   // filler CPU, the gaps are not the QAT interrupt.
@@ -1586,24 +1856,28 @@ static void measure_qat_interrupt(const Options &options, const TscClock &clock,
 static void print_usage(FILE *stream) {
   fprintf(stream,
           "usage: preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|\n"
-          "                            qat-interrupt [options]\n"
+          "                            qat-interrupt|dsa-latency|dsa-floor [options]\n"
           "  --filler NAME        a filler, or all (default); repeat for more than one\n"
           "  --size BYTES         input size of each filler, a multiple of 64 (default 65536)\n"
-          "  --runs N             measured runs (default 2000 overhead, 1000 latency and\n"
-          "                       qat-latency, 10000 signal-floor, qat-floor and\n"
-          "                       qat-interrupt)\n"
+          "  --runs N             measured runs (default 2000 overhead, 1000 latency,\n"
+          "                       qat-latency and dsa-latency, 10000 signal-floor,\n"
+          "                       qat-floor, qat-interrupt and dsa-floor)\n"
           "  --cpu N              CPU of the filler (default 2)\n"
           "  --accelerator-cpu N  CPU of the emulated accelerator (default 4)\n"
-          "  --observer-cpu N     qat modes: CPU of the completion observer (default 6)\n"
-          "  --offload-bytes N    qat modes: bytes of each QAT decrypt, a multiple of 16,\n"
-          "                       at most 65536 (default 4096)\n"
-          "  --idle-us N          qat-floor and qat-interrupt modes: the device is idle for\n"
-          "                       N us before each offload (default 0)\n"
+          "  --observer-cpu N     qat and dsa modes: CPU of the completion observer\n"
+          "                       (default 6)\n"
+          "  --offload-bytes N    qat and dsa modes: bytes of each offload (default 4096);\n"
+          "                       for QAT a multiple of 16, at most 65536\n"
+          "  --work-queue PATH    dsa modes: the user WQ of the DSA device (default\n"
+          "                       /dev/dsa/wq0.1)\n"
+          "  --idle-us N          qat-floor, qat-interrupt and dsa-floor modes: the device\n"
+          "                       is idle for N us before each offload (default 0)\n"
           "  --offload-ns N       offload time; default uniform in [0, 0.9 x filler runtime]\n"
           "                       in latency mode, 1000 in signal-floor mode\n"
           "  --seed N             seed of the inputs and the offload times of each filler\n"
           "                       (default 1)\n"
-          "  --samples PATH       latency and qat-latency modes: also write each run to PATH\n"
+          "  --samples PATH       latency, qat-latency and dsa-latency modes: also write\n"
+          "                       each run to PATH\n"
           "  --ipp-code-path P    GCM code of ipp-crypto: native (default; VAES assembly on\n"
           "                       AVX-512 CPUs), aesni (AES-NI assembly), or portable-c\n"
           "                       (table C code, which has probe points in its block loop)\n"
@@ -1634,6 +1908,7 @@ static Options parse_options(int argc, char **argv) {
     accelerator_cpu_option,
     observer_cpu_option,
     offload_bytes_option,
+    work_queue_option,
     idle_us_option,
     offload_ns_option,
     seed_option,
@@ -1651,6 +1926,7 @@ static Options parse_options(int argc, char **argv) {
       {"accelerator-cpu", required_argument, nullptr, accelerator_cpu_option},
       {"observer-cpu", required_argument, nullptr, observer_cpu_option},
       {"offload-bytes", required_argument, nullptr, offload_bytes_option},
+      {"work-queue", required_argument, nullptr, work_queue_option},
       {"idle-us", required_argument, nullptr, idle_us_option},
       {"offload-ns", required_argument, nullptr, offload_ns_option},
       {"seed", required_argument, nullptr, seed_option},
@@ -1687,6 +1963,9 @@ static Options parse_options(int argc, char **argv) {
       case offload_bytes_option:
         options.offload_bytes = strtoull(optarg, nullptr, 0);
         break;
+      case work_queue_option:
+        options.work_queue_path = optarg;
+        break;
       case idle_us_option:
         options.idle_us = atof(optarg);
         break;
@@ -1713,9 +1992,11 @@ static Options parse_options(int argc, char **argv) {
         exit(2);
     }
   }
+  bool qat_mode = options.mode == "qat-latency" || options.mode == "qat-floor" ||
+                  options.mode == "qat-interrupt";
+  bool dsa_mode = options.mode == "dsa-latency" || options.mode == "dsa-floor";
   if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor" &&
-      options.mode != "qat-latency" && options.mode != "qat-floor" &&
-      options.mode != "qat-interrupt") {
+      !qat_mode && !dsa_mode) {
     print_usage(stderr);
     exit(2);
   }
@@ -1723,10 +2004,13 @@ static Options parse_options(int argc, char **argv) {
     fprintf(stderr, "--size must be a nonzero multiple of 64, at most 1 GiB\n");
     exit(2);
   }
+  if (options.offload_bytes == 0) {
+    fprintf(stderr, "--offload-bytes must be nonzero\n");
+    exit(2);
+  }
   // AF_ALG takes at most the socket send buffer (about 212 KB) in one sendmsg.
-  if (options.offload_bytes == 0 || options.offload_bytes % aes_block_bytes != 0 ||
-      options.offload_bytes > 65536) {
-    fprintf(stderr, "--offload-bytes must be a nonzero multiple of 16, at most 65536\n");
+  if (qat_mode && (options.offload_bytes % aes_block_bytes != 0 || options.offload_bytes > 65536)) {
+    fprintf(stderr, "--offload-bytes of a qat mode must be a multiple of 16, at most 65536\n");
     exit(2);
   }
   if (options.ipp_code_path != "native" && options.ipp_code_path != "aesni" &&
@@ -1737,7 +2021,8 @@ static Options parse_options(int argc, char **argv) {
   if (options.runs <= 0) {
     if (options.mode == "overhead") {
       options.runs = 2000;
-    } else if (options.mode == "latency" || options.mode == "qat-latency") {
+    } else if (options.mode == "latency" || options.mode == "qat-latency" ||
+               options.mode == "dsa-latency") {
       options.runs = 1000;
     } else {
       options.runs = 10000;
@@ -1800,6 +2085,67 @@ static FILE *open_samples_file(const std::string &path, const char *header) {
   return samples;
 }
 
+// The CSV header of qat-floor and dsa-floor. The interrupt column is named
+// after the /proc/interrupts lines that it counts.
+static std::string device_floor_header(const char *interrupt_name) {
+  return std::string(
+             "mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,"
+             "completed_during_submit,") +
+         interrupt_name +
+         "_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
+         "submit_median_ns,submit_p99_ns,"
+         "offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,"
+         "floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns,"
+         "filler_involuntary_switches,observer_involuntary_switches";
+}
+
+// The CSV header of qat-latency and dsa-latency.
+static std::string device_latency_header(const char *interrupt_name) {
+  return std::string(
+             "mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,"
+             "yielded,finished_after_completion,finished_before_completion,"
+             "wrong_outputs,failed_offloads,completed_during_submit,") +
+         interrupt_name +
+         "_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
+         "submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,"
+         "latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,"
+         "detect_median_ns,detect_p90_ns,detect_p99_ns,"
+         "switch_median_ns,switch_p90_ns,switch_p99_ns,"
+         "filler_median_ns,filler_involuntary_switches,observer_involuntary_switches";
+}
+
+template <typename DeviceOffload>
+static void run_device_floor(const Options &options, const TscClock &clock,
+                             DeviceOffload &offload) {
+  if (options.print_header) {
+    printf("%s\n", device_floor_header(DeviceOffload::interrupt_name).c_str());
+  }
+  CompletionObserver observer(options.observer_cpu);
+  measure_device_floor(options, clock, offload, observer);
+}
+
+template <typename DeviceOffload>
+static void run_device_latency(const Options &options, const TscClock &clock,
+                               DeviceOffload &offload) {
+  FILE *samples = open_samples_file(
+      options.samples_path,
+      "probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,"
+      "outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct");
+  if (options.print_header) {
+    printf("%s\n", device_latency_header(DeviceOffload::interrupt_name).c_str());
+  }
+  CompletionObserver observer(options.observer_cpu);
+  for (const std::string &name : options.filler_names) {
+    std::mt19937_64 input_random(options.seed);
+    std::unique_ptr<Filler> filler = find_filler_kind(name)->make(options.size_bytes, input_random);
+    measure_device_latency(name.c_str(), *filler, options, clock, offload, observer, samples);
+    fflush(stdout);
+  }
+  if (samples != nullptr) {
+    fclose(samples);
+  }
+}
+
 int main(int argc, char **argv) {
   Options options = parse_options(argc, argv);
   select_ipp_code_path(options.ipp_code_path);
@@ -1834,19 +2180,14 @@ int main(int argc, char **argv) {
 
   // The QAT instance of the kernel driver is on the NUMA node of the CPU that
   // makes the transform: the filler CPU, pinned above.
-  if (options.mode == "qat-floor") {
-    if (options.print_header) {
-      printf(
-          "mode,cpu,observer_cpu,offload_bytes,idle_us,runs,failed_offloads,completed_during_submit,"
-          "qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
-          "submit_median_ns,submit_p99_ns,"
-          "offload_median_ns,offload_p10_ns,offload_p90_ns,offload_p99_ns,"
-          "floor_median_ns,floor_p10_ns,floor_p90_ns,floor_p99_ns\n");
-    }
+  if (options.mode == "qat-floor" || options.mode == "qat-latency") {
     std::mt19937_64 offload_random(options.seed);
     QatDecryptOffload offload(options.offload_bytes, offload_random);
-    CompletionObserver observer(options.observer_cpu);
-    measure_qat_floor(options, clock, offload, observer);
+    if (options.mode == "qat-floor") {
+      run_device_floor(options, clock, offload);
+    } else {
+      run_device_latency(options, clock, offload);
+    }
     return 0;
   }
 
@@ -1870,35 +2211,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (options.mode == "qat-latency") {
-    FILE *samples = open_samples_file(
-        options.samples_path,
-        "probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,"
-        "outcome,detect_ns,switch_ns,latency_ns,output_correct,offload_output_correct");
-    if (options.print_header) {
-      printf(
-          "mode,probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,runs,"
-          "yielded,finished_after_completion,finished_before_completion,"
-          "wrong_outputs,failed_offloads,completed_during_submit,"
-          "qat_interrupts,busiest_interrupt_cpu,busiest_interrupt_cpu_count,"
-          "submit_median_ns,submit_p99_ns,offload_median_ns,offload_p99_ns,"
-          "latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,"
-          "detect_median_ns,detect_p90_ns,detect_p99_ns,"
-          "switch_median_ns,switch_p90_ns,switch_p99_ns,"
-          "filler_median_ns\n");
-    }
+  if (options.mode == "dsa-floor" || options.mode == "dsa-latency") {
     std::mt19937_64 offload_random(options.seed);
-    QatDecryptOffload offload(options.offload_bytes, offload_random);
-    CompletionObserver observer(options.observer_cpu);
-    for (const std::string &name : options.filler_names) {
-      std::mt19937_64 input_random(options.seed);
-      std::unique_ptr<Filler> filler =
-          find_filler_kind(name)->make(options.size_bytes, input_random);
-      measure_qat_latency(name.c_str(), *filler, options, clock, offload, observer, samples);
-      fflush(stdout);
-    }
-    if (samples != nullptr) {
-      fclose(samples);
+    DsaMemmoveOffload offload(options.work_queue_path, options.offload_bytes, offload_random);
+    if (options.mode == "dsa-floor") {
+      run_device_floor(options, clock, offload);
+    } else {
+      run_device_latency(options, clock, offload);
     }
     return 0;
   }
