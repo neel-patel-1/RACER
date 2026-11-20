@@ -7,12 +7,19 @@ writes itself (DSA, measured on sapphire).
   soffice --headless --convert-to pdf --outdir ~/Rack-Runtime/Slides \
       ~/Rack-Runtime/Slides/racer-preemption-paths.pptx
 
-The times are the medians of the README tables "Interrupt path", "Placement"
-(QAT) and "DSA results", at 4 KiB offloads. Time 0 is the time at which the
-completion gets to the CPU: the interrupt entry for MSI-X, the status byte of
-the record at the program core for DSA. The bars do not hold the time before
-that (device, coalescing timer and MSI-X message; device and record write),
-because the devices give no time stamp.
+The times are the medians of the README tables "Interrupt path", "Placement",
+"Latency" (QAT) and "DSA results", at 4 KiB offloads, and of
+milestones/M03-probe-points/results/qat-2026-11-15/irq-cpu/qat-latency.csv in
+p12-accel-chaining. Time 0 is the time at which the completion gets to the
+CPU: the interrupt entry for MSI-X, the status byte of the record at the
+program core for DSA. The bars do not hold the time before that (device,
+coalescing timer and MSI-X message; device and record write), because the
+devices give no time stamp.
+
+The zoom cuts the time after the completion write into the cache-line read
+miss, the wait to the next probe point and the thread (fiber) switch, and puts the
+three paths on one ns scale, lined up at the time at which the program can see
+the byte. A part is drawn at the middle of its range over the dense kernels.
 
 All drawings are shapes, so they can be edited in PowerPoint.
 """
@@ -38,9 +45,12 @@ TEXT = "262626"
 MUTED = "6B6B6B"
 RULE = "9A9A9A"
 WHITE = "FFFFFF"
+# One color and one light fill for each part of the time.
 KERNEL_COLOR = "2E6DB4"
-RETURN_COLOR = "6B4FA0"
-SIGNAL_COLOR, SIGNAL_FILL = "D9742B", "FBE3CF"
+RETURN_COLOR = "8B3F8F"
+READ_MISS_COLOR, READ_MISS_FILL = "C43C39", "F6D8D7"
+TO_NEXT_PROBE_COLOR, TO_NEXT_PROBE_FILL = "E0A82E", "FAEDCD"
+SWITCH_COLOR, SWITCH_FILL = "2A9D5C", "D4EEDF"
 
 # README "Interrupt path", 4 KiB, filler on the interrupt CPU (113).
 KERNEL_INTERRUPT_TO_WRITE_US = 3.13
@@ -55,6 +65,22 @@ FROM_WRITE_FILLER_ON_INTERRUPT_CPU_US = (0.596, 0.739)
 FROM_WRITE_FILLER_ON_OTHER_CORE_US = (0.247, 0.298)
 # README QAT "Interrupt path", 4 KiB.
 MSIX_SUBMIT_US, MSIX_OFFLOAD_US = 7.80, 16.9
+# README QAT "Latency", observer on the SMT sibling, dense kernels at interval
+# 200: the observer lag from the interrupt CPU (the move of the cache line that
+# the kernel wrote to the program core), detect and switch.
+MSIX_OTHER_CORE_READ_MISS_NS = 192
+MSIX_OTHER_CORE_TO_NEXT_PROBE_NS = (15, 52)
+MSIX_OTHER_CORE_SWITCH_NS = (39, 54)
+# qat-2026-11-15/irq-cpu/qat-latency.csv, filler on the interrupt CPU, dense
+# kernels at interval 200: the detect starts when the observer on the SMT
+# sibling sees the write (64 ns after it), and the program runs again 533 ns
+# after the write, so the time from the return to the next probe point is the
+# detect minus 469 ns. The kernel wrote the line on the program core: no read
+# miss.
+MSIX_INTERRUPT_CPU_TO_NEXT_PROBE_NS = (20, 150)
+MSIX_INTERRUPT_CPU_SWITCH_NS = (41, 53)
+# The core clocks of the README "Switch parts results".
+EMERALD_02_CORE_GHZ, SAPPHIRE_CORE_GHZ = 2.18, 3.02
 # README "DSA results": latency from the status byte of the completion record
 # at the program core to the scheduler running again, dense kernels at
 # interval 200, shared and dedicated WQ.
@@ -71,12 +97,19 @@ DSA_AFTER_SUBMIT_16_BYTES_US = (0.22, 0.42)
 
 AXIS_ZERO_X, INCHES_PER_US, AXIS_MAX_US = 3.0, 2.4, 4.0
 LABEL_X = 0.49
-LEGEND_Y = 1.72
-AXIS_Y = 2.27
-ROW_Y = [2.37, 2.97, 3.57]
-BAR_HEIGHT = 0.42
-ZOOM_Y, ZOOM_X, ZOOM_WIDTH = 4.2, AXIS_ZERO_X, 6.6
-LOWER_SECTION_Y = 4.75
+CONTENT_RIGHT_X = 12.85
+LEGEND_Y = 1.52
+AXIS_Y = 2.06
+ROW_Y = [2.16, 2.64, 3.12]
+BAR_HEIGHT = 0.38
+ZOOM_HEADER_Y = 3.66
+ZOOM_ROW_Y = [4.1, 4.42, 4.74]
+ZOOM_ROW_HEIGHT = 0.28
+ZOOM_INCHES_PER_NS = 0.023
+# The zoom rows line up at the time at which the program can see the byte; the
+# longest read miss (192 ns) is on the left of it.
+ZOOM_SEE_BYTE_X = AXIS_ZERO_X + ZOOM_INCHES_PER_NS * MSIX_OTHER_CORE_READ_MISS_NS
+LOWER_SECTION_Y = 5.16
 
 
 def middle(time_range):
@@ -170,10 +203,23 @@ def remove_all_slides(presentation):
         slide_ids.remove(slide_id)
 
 
+def range_text(time_range):
+    return f"{time_range[0]}-{time_range[1]}"
+
+
+def switch_cycles_range():
+    """The switch of the three paths in core cycles: the same code, at the clock of each host."""
+    cycles = [ns * EMERALD_02_CORE_GHZ for ns in MSIX_OTHER_CORE_SWITCH_NS + MSIX_INTERRUPT_CPU_SWITCH_NS]
+    cycles += [ns * SAPPHIRE_CORE_GHZ for ns in DSA_SWITCH_NS]
+    return round(min(cycles)), round(max(cycles))
+
+
 def draw_legend(slide):
-    entries = [(KERNEL_COLOR, "Kernel: interrupt → completion write", 3.0),
-               (RETURN_COLOR, "Kernel: write → return to the program", 3.1),
-               (SIGNAL_COLOR, "Cache line (MSI-X), probe point, switch", 3.4)]
+    entries = [(KERNEL_COLOR, "Kernel: interrupt → write", 2.15),
+               (RETURN_COLOR, "Kernel: write → return", 1.95),
+               (READ_MISS_COLOR, "Cache-line read miss", 1.85),
+               (TO_NEXT_PROBE_COLOR, "To the next probe point", 2.05),
+               (SWITCH_COLOR, "Thread (fiber) switch", 1.85)]
     x = AXIS_ZERO_X
     for color, label, width in entries:
         add_box(slide, x, LEGEND_Y + 0.06, 0.16, 0.16, fill=color, line=None)
@@ -211,45 +257,101 @@ def draw_axis(slide):
                  align=PP_ALIGN.CENTER)
 
 
-def draw_record_zoom(slide, bar_y, bar_end_x):
-    """The completion-record bar again, in ns, below the bars, so that its two parts can be read."""
-    parts = [(middle(DSA_TO_NEXT_PROBE_NS), f"to the next probe point  {DSA_TO_NEXT_PROBE_NS[0]}-{DSA_TO_NEXT_PROBE_NS[1]} ns"),
-             (middle(DSA_SWITCH_NS), f"switch  {DSA_SWITCH_NS[0]}-{DSA_SWITCH_NS[1]} ns")]
-    inches_per_ns = ZOOM_WIDTH / sum(time_ns for time_ns, _ in parts)
-    zoom_height = 0.36
-    add_line(slide, AXIS_ZERO_X, bar_y + BAR_HEIGHT, ZOOM_X, ZOOM_Y, color=RULE, dashed=True)
-    add_line(slide, bar_end_x, bar_y + BAR_HEIGHT, ZOOM_X + ZOOM_WIDTH, ZOOM_Y, color=RULE, dashed=True)
-    add_text(slide, LABEL_X, ZOOM_Y, AXIS_ZERO_X - LABEL_X - 0.1, zoom_height,
-             [[("zoom", True, MUTED), ("  completion record", False, MUTED)]], size_pt=10, align=PP_ALIGN.RIGHT,
-             anchor=MSO_ANCHOR.MIDDLE)
-    x = ZOOM_X
-    for time_ns, label in parts:
-        add_box(slide, x, ZOOM_Y, inches_per_ns * time_ns, zoom_height, [label] if label else (), fill=SIGNAL_FILL,
-                line=SIGNAL_COLOR, size_pt=10)
-        x += inches_per_ns * time_ns
+def draw_zoom_header(slide):
+    """The part on the left of the see-byte line is different between the paths, the parts on its right
+    are the same."""
+    header_height = ZOOM_ROW_Y[0] - ZOOM_HEADER_Y - 0.04
+    add_text(slide, LABEL_X, ZOOM_HEADER_Y, AXIS_ZERO_X - LABEL_X - 0.1, header_height,
+             [[("zoom", True, MUTED), ("  ns, after the write", False, MUTED)]], size_pt=10, align=PP_ALIGN.RIGHT,
+             anchor=MSO_ANCHOR.BOTTOM)
+    add_text(slide, AXIS_ZERO_X, ZOOM_HEADER_Y, ZOOM_SEE_BYTE_X - AXIS_ZERO_X - 0.08, header_height,
+             [[("Different: ", True, None), ("the cache-line read miss", False, None)],
+              [("before the program can see the byte", False, MUTED)]],
+             size_pt=11, align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.BOTTOM)
+    switch_cycles = switch_cycles_range()
+    add_text(slide, ZOOM_SEE_BYTE_X + 0.08, ZOOM_HEADER_Y, CONTENT_RIGHT_X - ZOOM_SEE_BYTE_X - 0.08, header_height,
+             [[("Same: ", True, None), ("the wait to the next probe point, then the thread (fiber) switch",
+                                         False, None)],
+              [(f"same kernels and probe points; same jump_fcontext code, {switch_cycles[0]}-{switch_cycles[1]} "
+                f"cycles in all three; only the clock differs ({EMERALD_02_CORE_GHZ:.2f} vs. "
+                f"{SAPPHIRE_CORE_GHZ:.2f} GHz)", False, MUTED)]],
+             size_pt=11, anchor=MSO_ANCHOR.BOTTOM)
+    add_line(slide, ZOOM_SEE_BYTE_X, ZOOM_HEADER_Y + 0.04, ZOOM_SEE_BYTE_X, ZOOM_ROW_Y[-1] + ZOOM_ROW_HEIGHT + 0.04,
+             color=TEXT, dashed=True)
+
+
+def draw_zoom_row(slide, y, name, read_miss, parts):
+    """read_miss is (time_ns, label) for a measured read miss, or the text that says why there is none
+    to draw. parts is a list of (time_ns, color, fill, label) on the right of the see-byte line."""
+    add_text(slide, LABEL_X, y, AXIS_ZERO_X - LABEL_X - 0.1, ZOOM_ROW_HEIGHT, [name], size_pt=11, bold=True,
+             align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE)
+    if isinstance(read_miss, str):
+        add_text(slide, AXIS_ZERO_X, y, ZOOM_SEE_BYTE_X - AXIS_ZERO_X - 0.08, ZOOM_ROW_HEIGHT, [read_miss],
+                 size_pt=10, color=MUTED, align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE)
+    else:
+        time_ns, label = read_miss
+        width = ZOOM_INCHES_PER_NS * time_ns
+        add_box(slide, ZOOM_SEE_BYTE_X - width, y, width, ZOOM_ROW_HEIGHT, [label], fill=READ_MISS_FILL,
+                line=READ_MISS_COLOR, size_pt=10)
+    x = ZOOM_SEE_BYTE_X
+    for time_ns, color, fill, label in parts:
+        width = ZOOM_INCHES_PER_NS * time_ns
+        add_box(slide, x, y, width, ZOOM_ROW_HEIGHT, [label], fill=fill, line=color, size_pt=10)
+        x += width
+
+
+def draw_zoom(slide):
+    """The time after the completion write of the three bars, cut into the read miss, the wait to the
+    next probe point and the switch, on one ns scale."""
+    draw_zoom_header(slide)
+
+    def to_next_probe(time_range, label_suffix=""):
+        return (middle(time_range), TO_NEXT_PROBE_COLOR, TO_NEXT_PROBE_FILL, f"{range_text(time_range)} ns{label_suffix}")
+
+    def switch(time_range):
+        return (middle(time_range), SWITCH_COLOR, SWITCH_FILL, f"{range_text(time_range)} ns")
+
+    draw_zoom_row(slide, ZOOM_ROW_Y[0], "MSI-X, interrupt CPU",
+                  f"none: this core wrote the line; the program runs {WRITE_TO_RETURN_US:.2f} µs later",
+                  [to_next_probe(MSIX_INTERRUPT_CPU_TO_NEXT_PROBE_NS, " after the return"),
+                   switch(MSIX_INTERRUPT_CPU_SWITCH_NS)])
+    draw_zoom_row(slide, ZOOM_ROW_Y[1], "MSI-X, other core",
+                  (MSIX_OTHER_CORE_READ_MISS_NS,
+                   f"core to core, from interrupt CPU 113   {MSIX_OTHER_CORE_READ_MISS_NS} ns"),
+                  [to_next_probe(MSIX_OTHER_CORE_TO_NEXT_PROBE_NS), switch(MSIX_OTHER_CORE_SWITCH_NS)])
+    draw_zoom_row(slide, ZOOM_ROW_Y[2], "Record (DSA)",
+                  "not measured: the device writes the line before 0 ns",
+                  [to_next_probe(DSA_TO_NEXT_PROBE_NS), switch(DSA_SWITCH_NS)])
 
 
 def draw_timeline(slide):
     draw_legend(slide)
-    probe_and_switch_after_return_us = middle(FROM_WRITE_FILLER_ON_INTERRUPT_CPU_US) - WRITE_TO_RETURN_US
     kernel_label = f"ISR, tasklet, QAT + AF_ALG callbacks, aio_complete   {KERNEL_INTERRUPT_TO_WRITE_US:.2f} µs"
+    interrupt_cpu_to_next_probe_us = middle(MSIX_INTERRUPT_CPU_TO_NEXT_PROBE_NS) / 1000
+    interrupt_cpu_switch_us = middle(MSIX_INTERRUPT_CPU_SWITCH_NS) / 1000
+    other_core_read_miss_us = MSIX_OTHER_CORE_READ_MISS_NS / 1000
+    other_core_to_next_probe_us = middle(MSIX_OTHER_CORE_TO_NEXT_PROBE_NS) / 1000
+    other_core_switch_us = middle(MSIX_OTHER_CORE_SWITCH_NS) / 1000
 
     draw_row_label(slide, ROW_Y[0], "MSI-X (QAT)", "program on the interrupt CPU")
     total_us = KERNEL_INTERRUPT_TO_WRITE_US + middle(FROM_WRITE_FILLER_ON_INTERRUPT_CPU_US)
     draw_bar(slide, ROW_Y[0], [(KERNEL_INTERRUPT_TO_WRITE_US, KERNEL_COLOR, kernel_label),
                                (WRITE_TO_RETURN_US, RETURN_COLOR, f"{WRITE_TO_RETURN_US:.2f} µs"),
-                               (probe_and_switch_after_return_us, SIGNAL_COLOR, None)], f"{total_us:.1f} µs")
+                               (interrupt_cpu_to_next_probe_us, TO_NEXT_PROBE_COLOR, None),
+                               (interrupt_cpu_switch_us, SWITCH_COLOR, None)], f"{total_us:.1f} µs")
 
     draw_row_label(slide, ROW_Y[1], "MSI-X (QAT)", "program on another core")
     total_us = KERNEL_INTERRUPT_TO_WRITE_US + middle(FROM_WRITE_FILLER_ON_OTHER_CORE_US)
     draw_bar(slide, ROW_Y[1], [(KERNEL_INTERRUPT_TO_WRITE_US, KERNEL_COLOR, kernel_label),
-                               (middle(FROM_WRITE_FILLER_ON_OTHER_CORE_US), SIGNAL_COLOR, None)],
-             f"{total_us:.1f} µs")
+                               (other_core_read_miss_us, READ_MISS_COLOR, None),
+                               (other_core_to_next_probe_us, TO_NEXT_PROBE_COLOR, None),
+                               (other_core_switch_us, SWITCH_COLOR, None)], f"{total_us:.1f} µs")
 
     draw_row_label(slide, ROW_Y[2], "Completion record (DSA)", "device writes the record")
-    bar_end_x = draw_bar(slide, ROW_Y[2], [(middle(DSA_LATENCY_NS) / 1000, SIGNAL_COLOR, None)],
-                         f"{DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns")
-    draw_record_zoom(slide, ROW_Y[2], bar_end_x)
+    draw_bar(slide, ROW_Y[2], [(middle(DSA_TO_NEXT_PROBE_NS) / 1000, TO_NEXT_PROBE_COLOR, None),
+                               (middle(DSA_SWITCH_NS) / 1000, SWITCH_COLOR, None)],
+             f"{DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns")
+    draw_zoom(slide)
     draw_axis(slide)
 
 
@@ -267,7 +369,7 @@ def draw_paths(slide, x, y, width):
 
 def draw_comparison(slide, x, y):
     column_widths = [2.8, 1.35, 1.75]
-    row_height = 0.26
+    row_height = 0.24
     rows = [("4 KiB offloads", "MSI-X (QAT)", "Record (DSA)"),
             ("Completion at the CPU → switch", "3.4-3.8 µs", f"{DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns"),
             ("Kernel CPU time, each completion", f"{KERNEL_CPU_TIME_US:.2f} µs", "0 (no interrupt)"),
@@ -291,8 +393,9 @@ def draw_comparison(slide, x, y):
 
 
 def draw_footnote(slide):
-    add_text(slide, LABEL_X, 6.42, 12.4, 0.5,
-             ["0 µs: the interrupt entry (MSI-X) or the record byte at the program core (DSA). Medians. "
+    add_text(slide, LABEL_X, 6.68, 11.9, 0.5,
+             ["0 µs: the interrupt entry (MSI-X) or the record byte at the program core (DSA). Medians; "
+              "a part of a bar or of the zoom is drawn at the middle of its range over the 7 dense kernels. "
               "MSI-X: QAT 4xxx decrypt, emerald-02, 10,000 offloads a row. DSA: dsa0 memory move, sapphire, "
               "7 dense kernels at probe interval 200, shared and dedicated WQ. Not in the bars: QAT device + "
               f"coalescing timer + MSI-X message, {DEVICE_AND_DELIVERY_US:.2f} µs (timer + MSI-X ≤ "
@@ -309,11 +412,19 @@ def build_slide(presentation):
         "Time from the completion to the switch of the program to the scheduler, at 4 KiB offloads. "
         "MSI-X (QAT, measured on emerald-02): the kernel handles the interrupt and writes the completion byte "
         "3.13 µs after the interrupt gets to the CPU. A program on the interrupt CPU runs again 0.53 µs after "
-        "the write. A program on another core sees the byte 0.25-0.30 µs after the write. A DSA device writes "
+        "the write. A program on another core switches 0.25-0.30 µs after the write. A DSA device writes "
         "its completion record itself (measured on sapphire): there is no interrupt and no kernel code, and the "
-        f"program switches {DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns after the byte gets to its core "
-        f"({DSA_TO_NEXT_PROBE_NS[0]}-{DSA_TO_NEXT_PROBE_NS[1]} ns to the next probe point, "
-        f"{DSA_SWITCH_NS[0]}-{DSA_SWITCH_NS[1]} ns to switch). The MSI-X kernel time also takes 3.66 µs of "
+        f"program switches {DSA_LATENCY_NS[0]}-{DSA_LATENCY_NS[1]} ns after the byte gets to its core. "
+        "The zoom cuts the time after the write into three parts. Different: the cache-line read miss. On "
+        f"another core it is {MSIX_OTHER_CORE_READ_MISS_NS} ns, the move of the line that the kernel wrote on the "
+        "interrupt CPU. On the interrupt CPU there is none, because the same core wrote the line. For DSA it is "
+        "before 0 ns and not measured, because the device writes the line. Same: the wait to the next probe "
+        f"point ({range_text(MSIX_OTHER_CORE_TO_NEXT_PROBE_NS)} ns QAT, {range_text(DSA_TO_NEXT_PROBE_NS)} ns DSA; "
+        "the same kernels and probe points) and the thread (fiber) switch "
+        f"({range_text(MSIX_OTHER_CORE_SWITCH_NS)} ns QAT, {range_text(DSA_SWITCH_NS)} ns DSA). The switch is "
+        "the same jump_fcontext code with about the same core cycles; the ns are different because the "
+        "emerald-02 clock is slower. After the return on the interrupt CPU the wait to the next probe point is "
+        f"{range_text(MSIX_INTERRUPT_CPU_TO_NEXT_PROBE_NS)} ns. The MSI-X kernel time also takes 3.66 µs of "
         "CPU time from the program on the interrupt CPU for each completion, and grows by 0.66-0.72 µs for "
         "each 4 KiB page. On sapphire the DSA submit is a write() system call, because the driver does not map "
         "the WQ portal on a DSA with the user-submission erratum.")
