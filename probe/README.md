@@ -122,12 +122,12 @@ nothing.
 
 ```
 preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|
-              qat-interrupt|dsa-latency|dsa-floor [options]
+              qat-interrupt|dsa-latency|dsa-floor|switch-floor [options]
   --filler NAME        a filler, or all (default); repeat for more than one
   --size BYTES         input size of each filler, a multiple of 64 (default 65536)
   --runs N             measured runs (default 2000 overhead, 1000 latency,
                        qat-latency and dsa-latency, 10000 signal-floor,
-                       qat-floor, qat-interrupt and dsa-floor)
+                       qat-floor, qat-interrupt, dsa-floor and switch-floor)
   --cpu N              CPU of the filler (default 2)
   --accelerator-cpu N  CPU of the emulated accelerator (default 4)
   --observer-cpu N     qat and dsa modes: CPU of the completion observer
@@ -144,6 +144,13 @@ preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|
                        (default 1)
   --samples PATH       latency, qat-latency and dsa-latency modes: also write
                        each run to PATH
+  --switch-parts PATH  latency, qat-latency, dsa-latency and switch-floor modes:
+                       cut the switch of each yield into parts with TSC stamps,
+                       and write one row of part medians a filler to PATH
+  --yield-jump J       the jump of do_yield to the scheduler: boost (default;
+                       jump_fcontext), own-copy (a copy of jump_fcontext that
+                       only do_yield calls) or no-fpu-control-load
+                       (jump_fcontext without ldmxcsr and fldcw)
   --ipp-code-path P    GCM code of ipp-crypto: native (default; VAES assembly on
                        AVX-512 CPUs), aesni (AES-NI assembly), or portable-c
                        (table C code, which has probe points in its block loop)
@@ -208,6 +215,8 @@ CSV columns:
 - latency: `mode,probe_interval,ipp_code_path,filler,size_bytes,runs,yielded,finished_after_completion,finished_before_completion,late_completions,wrong_outputs,latency_median_ns,latency_p90_ns,latency_p99_ns,latency_max_ns,detect_median_ns,detect_p90_ns,detect_p99_ns,switch_median_ns,switch_p90_ns,switch_p99_ns,filler_median_ns`
 - `--samples`: `probe_interval,ipp_code_path,filler,size_bytes,run,offload_ns,accelerator_lateness_ns,outcome,detect_ns,switch_ns,latency_ns,output_correct`
 - signal-floor: `mode,cpu,accelerator_cpu,runs,late_completions,median_ns,p10_ns,p90_ns,p99_ns,max_ns`
+- switch-floor: `mode,cpu,yield_jump,switch_parts,runs,core_ghz,switch_median_ns,switch_p10_ns,switch_p90_ns,switch_p99_ns`
+- `--switch-parts`: `mode,probe_interval,filler,cpu,yield_jump,core_ghz,yields,switch_with_stamps_median_ns,switch_without_part_stamps_median_ns,switch_without_part_stamps_p90_ns,stamp_median_ns,checks_median_ns,checks_p90_ns,store_drain_median_ns,store_drain_p90_ns,context_load_median_ns,context_load_p90_ns,jump_median_ns,jump_p90_ns` (see [Switch parts](#switch-parts))
 
 ## Results
 
@@ -794,6 +803,135 @@ switch counts summed over the 7 kernels:
   runs).
 - A run on an idle host would remove most of the switches and the high p99
   values.
+
+## Switch parts
+
+The switch is a fiber switch, not a switch of the OS. `do_yield` reads the
+TSC (the filler stop), stores the time and calls `fcontext_swap`, which calls
+`jump_fcontext` of Boost.Context (`src/jump_x86_64_sysv_elf_gas.S`).
+`jump_fcontext` does these steps:
+
+1. It saves the MXCSR, the x87 control word and the six callee-saved
+   registers on the filler stack (64 bytes with the return address).
+2. It sets the stack pointer to the saved context of the scheduler.
+3. It loads the two control words (`ldmxcsr`, `fldcw`) and the six registers
+   from that context.
+4. It jumps to the return address of the scheduler (`jmp *%r8`).
+
+Then the scheduler reads the TSC. A TSC read is a stamp: `lfence; rdtsc;
+lfence` and a store. The switch has one stamp in it: the filler stop is the
+end of the first stamp, and the scheduler stamp ends after its `rdtsc`.
+
+`--switch-parts PATH` adds four stamps to the yield
+(`yield_with_switch_experiment`) and cuts the switch into the parts below.
+Each part has one stamp in it, and the script subtracts it.
+
+| Part | What it is |
+|---|---|
+| stamp | one stamp, from two stamps in a row |
+| checks | the flag checks of `do_yield` and the store of the filler stop time |
+| store drain | an `mfence`: the stores of the filler leave the store buffer. A switch with no part stamps has no `mfence`. The tables show the store drain minus that of the yield loop: this is the most time that the stores of the filler can add |
+| context load | loads of byte 0 and byte 63 of the saved context of the scheduler: a cache miss if the filler evicted the context |
+| jump | the jump function and the scheduler code up to its stamp |
+
+`--yield-jump` selects the jump of `do_yield`: `boost` (`jump_fcontext`),
+`own-copy` (a copy that only `do_yield` calls, so its indirect jump always
+goes to the same place) or `no-fpu-control-load` (no `ldmxcsr` and `fldcw`).
+The jump of `boost` minus the jump of `no-fpu-control-load` is the cost of the
+two control-word loads. `switch-floor` mode measures the switch of a fiber
+that only yields (the yield loop), with no filler and no device.
+
+```
+WARM_UP_SECONDS=15 scripts/run-switch-parts.sh results/switch-parts/qat \
+  qat-latency 113 42 --size 1048576 --runs 1000 --offload-bytes 4096
+scripts/summarize-switch-parts.py results/switch-parts/qat --core-ghz 2.18
+```
+
+`run-switch-parts.sh` runs each jump with and without the part stamps, and
+`switch-floor` with each jump, in each sweep (`SWEEPS`, default 3), with
+the 7 dense kernels (`FILLERS`) and `build/interval-200` (`PREEMPT_BENCH`).
+`WARM_UP_SECONDS` keeps the filler CPU busy before each run, so that the
+clock is up. `summarize-switch-parts.py` gives the median over the sweeps in
+ns and in core cycles. The cycles use the clock that preempt_bench measures
+on the filler CPU, or `--core-ghz`. The script prints a note if the stamp
+changes by more than 10 % from one filler to the next: the stamp is a fixed
+number of core cycles, so the clock changed in the runs.
+
+### Switch parts results
+
+The 7 dense kernels at interval 200, 1 MiB inputs, 4 KiB offloads, 3 sweeps,
+jump `boost`. Each value is the median over the 7 kernels, ns (core cycles),
+with the range over the kernels for the switch:
+
+| Part | DSA, sapphire 8 / 48 | QAT, emerald-02 38 / 110 | QAT, emerald-02 113 / 42 | QAT, emerald-03 1 / 2 |
+|---|---|---|---|---|
+| Interrupt on the filler CPU | no interrupt | no | yes | yes |
+| Observer | SMT sibling | SMT sibling | another core | another core (no SMT) |
+| Core clock | 3.02 GHz | 2.18 GHz | 2.18 GHz | 3.00 GHz |
+| **Switch, no part stamps** | **32 (97)**, 29-40 ns | **53 (116)**, 45-58 ns | **55 (120)**, 54-65 ns | **34 (102)**, 33-44 ns |
+| Stamp | 22 (66) | 30.9 (67) | 31.8 (69) | 19.2 (58) |
+| Checks | 2 (6) | 7.3 (16) | 8.2 (18) | 4.2 (13) |
+| Store drain | 3 (9) | −1.8 (−4) | 0 (0) | 0 (0) |
+| Context load | 1 (3) | 7.3 (16) | 11.8 (26) | 5.8 (17) |
+| Jump | 8 (24) | 10.0 (22) | 10.9 (24) | 4.2 (13) |
+| of which `ldmxcsr` and `fldcw` | 4 (12) | 4.5 (10) | 5.4 (12) | 0.9 (3) |
+| Sum of the parts | 36 (109) | 56.4 (123) | 61.8 (135) | 35.1 (105) |
+| Switch minus the stamp | 10 (30) | 22.1 (48) | 25.0 (55) | 14.8 (44) |
+
+The switch floor (`switch-floor`, the yield loop) on the same filler CPUs:
+
+| Host, filler CPU | Switch | Stamp | `mfence` | Jump | Jump, no `ldmxcsr` and `fldcw` |
+|---|---|---|---|---|---|
+| sapphire 8 | 24 (72) | 20 (60) | 11 (33) | 4 (12) | 3 (9) |
+| emerald-02 38 | 39.1 (85) | 29.1 (63) | 20.0 (44) | 9.1 (20) | 6.4 (14) |
+| emerald-02 113 | 41.8 (91) | 31.8 (69) | 20.9 (46) | 10.9 (24) | 5.5 (12) |
+| emerald-03 1 | 23.3 (70) | 19.2 (58) | 12.5 (38) | 4.2 (13) | 3.3 (10) |
+
+- The stamp is the largest part: 58-69 cycles, 55-65 % of the switch.
+  Without it, the switch is 30-55 cycles (10-25 ns). The stamp is about 58
+  cycles with the SMT sibling idle or with no SMT, and 63-69 cycles with a
+  busy sibling (an observer spin loop, or other jobs on emerald-02).
+- The parts add up to 3-13 % more than the switch: the `lfence` of each part
+  stamp stops the overlap of the parts.
+- DSA and QAT with the observer on the SMT sibling switch in 97 and 116
+  cycles. The clock (3.02 vs. 2.18 GHz) gives about 60 % of the ns
+  difference (32 vs. 53 ns). In cycles, QAT has 10 more in the checks and 13
+  more in the context load, and 13 fewer in the store drain. The checks are
+  13-18 cycles on the emerald hosts and 6 cycles on sapphire. The cause is
+  not measured; other jobs on emerald-02 are a possible cause.
+- QAT on emerald-03 at 3.00 GHz switches in 34 ns (102 cycles), about the
+  same as DSA (32 ns, 97 cycles). So the difference between the DSA switch
+  (31-41 ns) and the QAT switch (39-56 ns) comes mostly from the host, not
+  from the completion path.
+- The interrupt on the filler CPU adds 5-9 ns to the context load of
+  `hash`, `dotproduct` and `histogram` (emerald-02 38 vs. 113: 1-4 vs.
+  8-11 ns). A likely cause is that the kernel code of the interrupt evicts
+  the saved context. It adds only 1-2 ns to `gather`, `scatter-update` and
+  `sequential-writer`, which evict the context themselves (10-13 ns on both
+  CPUs). On emerald-03, also with the interrupt on the filler CPU, the three
+  kernels load the context in 2-5 ns. The cause is not measured.
+- `ldmxcsr` and `fldcw` cost 10-12 cycles with a busy SMT sibling (sapphire
+  with the observer, emerald-02), and about 3 cycles with an idle sibling or
+  with no SMT (all floors, emerald-03). This is an inference from the rows;
+  it is not measured with counters.
+- `own-copy` gives no gain: the indirect jump of `jump_fcontext` predicts
+  well.
+- The orange segment of the preemption slide (about 134 ns after the return
+  to user space, filler on the interrupt CPU of emerald-02) is the switch,
+  about 55 ns (stamp 32, checks 8, context load 12, jump 11), and about
+  80 ns from the return to the probe point that sees the byte. The filler
+  runs from the interrupted instruction to its next probe point after about
+  3.7 µs of kernel code on its core; this time is not cut into parts. With
+  the interrupt on another CPU, the detect is 15-52 ns.
+- `matmul` (69 ms a run) has about 225 filler and 15,000 observer
+  involuntary switches on emerald-02 113 / 42 (another job on CPU 42).
+- On emerald-03 the ondemand governor changes the clock between runs and in
+  runs (0.8, 2.3, 2.4 and 3.0 GHz). The run with the filler on CPU 4 (no
+  interrupt) has a stamp of 19.2-41.7 ns and some empty rows, so it is not
+  in the tables.
+- On emerald-02 a binary from before the fastest-chain clock measure gave
+  1.06-1.10 GHz on CPU 38, which another task shared. The performance
+  governor holds 2.18 GHz, so the emerald-02 cycles use `--core-ghz 2.18`.
 
 ## Limits
 

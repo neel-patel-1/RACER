@@ -40,6 +40,11 @@
 //                 status byte of the completion record that the device
 //                 writes. No kernel code is on the completion path.
 //   dsa-floor     qat-floor with the DSA device of dsa-latency.
+//   switch-floor  the least switch time: a fiber with no filler calls do_yield
+//                 in a loop, and the scheduler swaps back to it at once.
+//
+// The switch parts (--switch-parts) and the yield jump (--yield-jump) find the
+// parts of the switch: see the comment above yield_with_switch_experiment.
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/aio_abi.h>
@@ -114,6 +119,96 @@ static inline uint64_t read_tsc() {
   return tsc;
 }
 
+// The variants of jump_fcontext in jump_fcontext_variants.S.
+extern "C" fcontext_transfer_t jump_fcontext_yield_copy(fcontext_t const to, void *vp);
+extern "C" fcontext_transfer_t jump_fcontext_no_fpu_control_load(fcontext_t const to, void *vp);
+
+// The function that do_yield jumps to the scheduler with.
+enum class YieldJump {
+  boost,                // jump_fcontext, as the scheduler uses
+  own_copy,             // jump_fcontext_yield_copy
+  no_fpu_control_load,  // jump_fcontext_no_fpu_control_load
+};
+
+static const char *yield_jump_name(YieldJump yield_jump) {
+  switch (yield_jump) {
+    case YieldJump::boost:
+      return "boost";
+    case YieldJump::own_copy:
+      return "own-copy";
+    case YieldJump::no_fpu_control_load:
+      return "no-fpu-control-load";
+  }
+  return "unknown";
+}
+
+// The TSC stamps that do_yield takes between its entry stamp (the filler stop)
+// and the jump, when stamping_switch_parts is true. The scheduler takes the
+// last stamp when the jump returns into it.
+struct SwitchPartStamps {
+  uint64_t checks_end_tsc;      // after the flag checks and the call
+  uint64_t second_stamp_tsc;    // at once after checks_end_tsc: the time of a stamp
+  uint64_t stores_drained_tsc;  // after an mfence: the stores of the filler are in the cache
+  uint64_t context_loaded_tsc;  // after loads of the two cache lines of the scheduler context
+};
+
+// Set once in main, before the first filler. While switch_experiment_active
+// is false, do_yield jumps with jump_fcontext and takes no stamps.
+static thread_local bool switch_experiment_active = false;
+static thread_local bool stamping_switch_parts = false;
+static thread_local YieldJump yield_jump = YieldJump::boost;
+static thread_local SwitchPartStamps switch_part_stamps;
+
+static fcontext_transfer_t jump_to_scheduler(fcontext_t scheduler_context) {
+  switch (yield_jump) {
+    case YieldJump::boost:
+      return jump_fcontext(scheduler_context, nullptr);
+    case YieldJump::own_copy:
+      return jump_fcontext_yield_copy(scheduler_context, nullptr);
+    case YieldJump::no_fpu_control_load:
+      return jump_fcontext_no_fpu_control_load(scheduler_context, nullptr);
+  }
+  abort();
+}
+
+// The yield of do_yield when switch_experiment_active is true. The switch is
+// from the entry stamp of do_yield to the stamp of the scheduler after the
+// jump. With stamping_switch_parts, four more stamps cut it into parts, in
+// this order:
+//   checks        the flag checks of do_yield and the call of this function
+//   store drain   an mfence: the time for the stores of the filler that are
+//                 still in the store buffer to reach the cache. Without the
+//                 mfence, the switch waits for them only when the store
+//                 buffer has no free entry for the 9 stores of the call and
+//                 the jump (the return address and the saved context).
+//   context load  loads of the first and the last byte of the 64-byte saved
+//                 context of the scheduler, which can be on two cache lines.
+//                 The jump loads the same lines.
+//   jump          the selected jump function and the code of the scheduler
+//                 from the return of fcontext_swap to its stamp. With the
+//                 store buffer empty and the context in the cache, this is
+//                 the instructions and the indirect jump.
+// A stamp is lfence, rdtsc, lfence and a store. Each part has the time of one
+// stamp in it; the stamp part (second_stamp_tsc - checks_end_tsc) gives it.
+// The switch without the stamps has one stamp in it, as the switch of a run
+// without --switch-parts does.
+static __attribute__((noinline)) void yield_with_switch_experiment(uint64_t yield_tsc) {
+  filler_stopped_tsc = yield_tsc;
+  if (stamping_switch_parts) {
+    switch_part_stamps.checks_end_tsc = read_tsc();
+    switch_part_stamps.second_stamp_tsc = read_tsc();
+    _mm_mfence();
+    switch_part_stamps.stores_drained_tsc = read_tsc();
+    const volatile uint8_t *scheduler_context =
+        reinterpret_cast<const volatile uint8_t *>(scheduler_transfer.prev_context);
+    (void)scheduler_context[0];
+    (void)scheduler_context[63];
+    // The lfence of read_tsc waits for the two loads.
+    switch_part_stamps.context_loaded_tsc = read_tsc();
+  }
+  scheduler_transfer = jump_to_scheduler(scheduler_transfer.prev_context);
+}
+
 extern "C" void do_yield(void) {
   uint64_t yield_tsc = read_tsc();
   if (counting_probe_executions) {
@@ -123,6 +218,10 @@ extern "C" void do_yield(void) {
   if (!inside_filler_fiber) {
     fprintf(stderr, "do_yield outside a filler fiber: preempt_signal points at a set byte\n");
     abort();
+  }
+  if (switch_experiment_active) {
+    yield_with_switch_experiment(yield_tsc);
+    return;
   }
   filler_stopped_tsc = yield_tsc;
   scheduler_transfer = fcontext_swap(scheduler_transfer.prev_context, nullptr);
@@ -1208,6 +1307,14 @@ static void filler_fiber_entry(fcontext_transfer_t transfer) {
   // The scheduler never swaps back to a finished filler.
 }
 
+// The fiber of switch-floor: it yields in a loop and never ends.
+static void yield_loop_fiber_entry(fcontext_transfer_t transfer) {
+  scheduler_transfer = transfer;
+  while (true) {
+    do_yield();
+  }
+}
+
 // One fiber stack, used again for each run.
 class FillerFiber {
  public:
@@ -1215,10 +1322,10 @@ class FillerFiber {
   ~FillerFiber() { fcontext_destroy(state); }
   FillerFiber(const FillerFiber &) = delete;
   FillerFiber &operator=(const FillerFiber &) = delete;
-  // A new context at the top of the stack that enters filler_fiber_entry.
-  fcontext_t new_context() {
+  // A new context at the top of the stack that enters entry_function.
+  fcontext_t new_context(fcontext_fn_t entry_function = filler_fiber_entry) {
     return make_fcontext(state->stack + FCONTEXT_STACK_SIZE, FCONTEXT_STACK_SIZE,
-                         filler_fiber_entry);
+                         entry_function);
   }
 
  private:
@@ -1243,6 +1350,41 @@ static const char *outcome_name(RunOutcome outcome) {
   return "unknown";
 }
 
+// The parts of the switch of one yield with stamping_switch_parts, in TSC
+// ticks. See yield_with_switch_experiment.
+struct SwitchParts {
+  int64_t switch_with_stamps_ticks;  // from the filler stop to the scheduler stamp
+  int64_t stamp_ticks;
+  int64_t checks_ticks;
+  int64_t store_drain_ticks;
+  int64_t context_load_ticks;
+  int64_t jump_ticks;
+  // switch_with_stamps_ticks without the four stamps of the parts: the sum
+  // of stamp_ticks and the four parts.
+  int64_t switch_without_part_stamps_ticks;
+};
+
+// Call in the scheduler at once after a yield, before the filler can yield
+// again.
+static SwitchParts switch_parts_of_yield(uint64_t stopped_tsc, uint64_t scheduler_resumed_tsc) {
+  const SwitchPartStamps &stamps = switch_part_stamps;
+  SwitchParts parts;
+  parts.switch_with_stamps_ticks = static_cast<int64_t>(scheduler_resumed_tsc - stopped_tsc);
+  parts.stamp_ticks = static_cast<int64_t>(stamps.second_stamp_tsc - stamps.checks_end_tsc);
+  parts.checks_ticks =
+      static_cast<int64_t>(stamps.checks_end_tsc - stopped_tsc) - parts.stamp_ticks;
+  parts.store_drain_ticks =
+      static_cast<int64_t>(stamps.stores_drained_tsc - stamps.second_stamp_tsc) -
+      parts.stamp_ticks;
+  parts.context_load_ticks =
+      static_cast<int64_t>(stamps.context_loaded_tsc - stamps.stores_drained_tsc) -
+      parts.stamp_ticks;
+  parts.jump_ticks =
+      static_cast<int64_t>(scheduler_resumed_tsc - stamps.context_loaded_tsc) - parts.stamp_ticks;
+  parts.switch_without_part_stamps_ticks = parts.switch_with_stamps_ticks - 4 * parts.stamp_ticks;
+  return parts;
+}
+
 struct PreemptedRun {
   RunOutcome outcome;
   // From the completion to the filler stop: the entry of do_yield at the probe
@@ -1256,6 +1398,8 @@ struct PreemptedRun {
   // takes the accelerator CPU away: the run then does not show the probes.
   int64_t accelerator_lateness_ticks;
   bool output_correct;
+  // Only for a yield with stamping_switch_parts.
+  std::optional<SwitchParts> switch_parts;
 };
 
 // Runs the filler in the fiber while an offload is in flight. After a yield,
@@ -1278,13 +1422,16 @@ static PreemptedRun run_filler_with_offload(Filler &filler, FillerFiber &fiber,
   preempt_signal = &signal_byte_never_set;
   uint64_t stopped_tsc = filler_stopped_tsc;
   bool yielded = !filler_finished;
+  PreemptedRun run;
+  if (yielded && stamping_switch_parts) {
+    run.switch_parts = switch_parts_of_yield(stopped_tsc, scheduler_resumed_tsc);
+  }
   if (yielded) {
     fcontext_swap(from_filler.prev_context, nullptr);
   }
   inside_filler_fiber = false;
   accelerator.wait_until_idle();
 
-  PreemptedRun run;
   run.detect_ticks = static_cast<int64_t>(stopped_tsc - record.completion_tsc);
   run.switch_ticks = static_cast<int64_t>(scheduler_resumed_tsc - stopped_tsc);
   run.accelerator_lateness_ticks =
@@ -1321,6 +1468,8 @@ struct DeviceOffloadRun {
   bool completed_during_submit;
   bool output_correct;
   bool offload_output_correct;
+  // Only for a yield with stamping_switch_parts.
+  std::optional<SwitchParts> switch_parts;
 };
 
 // run_filler_with_offload with a QAT or DSA offload in flight.
@@ -1345,6 +1494,10 @@ static DeviceOffloadRun run_filler_with_device_offload(Filler &filler, FillerFib
   preempt_signal = &signal_byte_never_set;
   uint64_t stopped_tsc = filler_stopped_tsc;
   bool yielded = !filler_finished;
+  DeviceOffloadRun run;
+  if (yielded && stamping_switch_parts) {
+    run.switch_parts = switch_parts_of_yield(stopped_tsc, scheduler_resumed_tsc);
+  }
   if (yielded) {
     fcontext_swap(from_filler.prev_context, nullptr);
   }
@@ -1352,7 +1505,6 @@ static DeviceOffloadRun run_filler_with_device_offload(Filler &filler, FillerFib
   bool offload_output_correct = offload.reap();
   uint64_t completion_seen_tsc = observer.wait_for_completion_tsc();
 
-  DeviceOffloadRun run;
   run.submit_ticks = static_cast<int64_t>(submit_end_tsc - submit_start_tsc);
   run.offload_ticks = static_cast<int64_t>(completion_seen_tsc - submit_start_tsc);
   run.detect_ticks = static_cast<int64_t>(stopped_tsc - completion_seen_tsc);
@@ -1387,6 +1539,8 @@ struct Options {
   double offload_ns = 0;  // 0: the default of the mode
   uint64_t seed = 1;
   std::string samples_path;
+  std::string switch_parts_path;
+  YieldJump yield_jump = YieldJump::boost;
   std::string ipp_code_path = "native";
   bool print_header = true;
 };
@@ -1410,6 +1564,104 @@ static uint64_t warm_up(Filler &filler) {
   }
   return filler.checksum();
 }
+
+// The clock of the filler core in GHz over one chain of 2 million dependent
+// register adds (about 1 ms), one core cycle each. The TSC does not count core
+// cycles: its rate is the same at each core clock.
+static double time_core_ghz_once(const TscClock &clock) {
+  constexpr uint64_t iterations = 250000;
+  constexpr int adds_per_iteration = 8;
+  uint64_t sum = 0;
+  uint64_t one = 1;
+  uint64_t start_tsc = read_tsc();
+  for (uint64_t iteration = 0; iteration < iterations; iteration++) {
+    // Register operands: the renamer of a core can do an add of an immediate
+    // with no execution cycle.
+    asm volatile(
+        "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+        "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0"
+        : "+r"(sum)
+        : "r"(one));
+  }
+  uint64_t end_tsc = read_tsc();
+  return static_cast<double>(adds_per_iteration * iterations) /
+         clock.ticks_to_ns(static_cast<double>(end_tsc - start_tsc));
+}
+
+// The clock of the filler core in GHz, after the clock is steady. The
+// schedutil governor of sapphire raises the clock of an idle core over tens of
+// ms of work, so this times chains of adds until two in a row agree within 1 %
+// (at most 1000 chains, about 1 s). It also keeps the core busy until the runs
+// that follow start at that clock. Then it gives the fastest of 50 more
+// chains: when another task shares the CPU, a chain that the task interrupts
+// takes longer and gives a lower clock (on emerald-02, a CPU that two tasks
+// shared gave 1.10 GHz with 80 ms chains, and 2.18 GHz alone). The ondemand
+// governor of emerald-03 can hold a busy core at its lowest clock (0.8 GHz)
+// for more than 8 s, so a run there has a clock that changes in the run.
+static double measure_core_ghz(const TscClock &clock) {
+  double previous_ghz = time_core_ghz_once(clock);
+  for (int chain = 1; chain < 1000; chain++) {
+    double ghz = time_core_ghz_once(clock);
+    bool clock_is_steady = std::fabs(ghz - previous_ghz) <= 0.01 * ghz;
+    previous_ghz = ghz;
+    if (clock_is_steady) {
+      break;
+    }
+  }
+  double fastest_ghz = previous_ghz;
+  for (int chain = 0; chain < 50; chain++) {
+    fastest_ghz = std::max(fastest_ghz, time_core_ghz_once(clock));
+  }
+  return fastest_ghz;
+}
+
+// The CSV header of the --switch-parts file. The part columns are in ns.
+constexpr const char *switch_parts_header =
+    "mode,probe_interval,filler,cpu,yield_jump,core_ghz,yields,"
+    "switch_with_stamps_median_ns,switch_without_part_stamps_median_ns,"
+    "switch_without_part_stamps_p90_ns,stamp_median_ns,"
+    "checks_median_ns,checks_p90_ns,store_drain_median_ns,store_drain_p90_ns,"
+    "context_load_median_ns,context_load_p90_ns,jump_median_ns,jump_p90_ns";
+
+// The switch parts of the yields of one filler, in ns.
+class SwitchPartsCollector {
+ public:
+  void add(const SwitchParts &parts, const TscClock &clock) {
+    auto ns = [&clock](int64_t ticks) { return clock.ticks_to_ns(static_cast<double>(ticks)); };
+    switches_with_stamps_ns.push_back(ns(parts.switch_with_stamps_ticks));
+    switches_without_part_stamps_ns.push_back(ns(parts.switch_without_part_stamps_ticks));
+    stamps_ns.push_back(ns(parts.stamp_ticks));
+    checks_ns.push_back(ns(parts.checks_ticks));
+    store_drains_ns.push_back(ns(parts.store_drain_ticks));
+    context_loads_ns.push_back(ns(parts.context_load_ticks));
+    jumps_ns.push_back(ns(parts.jump_ticks));
+  }
+  // Writes one row with switch_parts_header.
+  void write_row(FILE *file, const Options &options, const char *filler_name,
+                 double core_ghz) const {
+    fprintf(file, "%s,%s,%s,%d,%s,%.2f,%zu", options.mode.c_str(), RACER_PROBE_INTERVAL,
+            filler_name, options.cpu, yield_jump_name(options.yield_jump), core_ghz,
+            switches_with_stamps_ns.size());
+    fprintf(file, ",%.1f,%.1f,%.1f,%.1f", percentile(switches_with_stamps_ns, 0.5),
+            percentile(switches_without_part_stamps_ns, 0.5),
+            percentile(switches_without_part_stamps_ns, 0.9), percentile(stamps_ns, 0.5));
+    for (const std::vector<double> *part_ns :
+         {&checks_ns, &store_drains_ns, &context_loads_ns, &jumps_ns}) {
+      fprintf(file, ",%.1f,%.1f", percentile(*part_ns, 0.5), percentile(*part_ns, 0.9));
+    }
+    fprintf(file, "\n");
+    fflush(file);
+  }
+
+ private:
+  std::vector<double> switches_with_stamps_ns;
+  std::vector<double> switches_without_part_stamps_ns;
+  std::vector<double> stamps_ns;
+  std::vector<double> checks_ns;
+  std::vector<double> store_drains_ns;
+  std::vector<double> context_loads_ns;
+  std::vector<double> jumps_ns;
+};
 
 // Runtimes in ns of runs with no offload in flight.
 static std::vector<double> time_runs(Filler &filler, int runs, uint64_t reference_checksum,
@@ -1463,12 +1715,14 @@ static void measure_overhead(const char *filler_name, Filler &filler, const Opti
 
 static void measure_latency(const char *filler_name, Filler &filler, const Options &options,
                             const TscClock &clock, EmulatedAccelerator &accelerator,
-                            std::mt19937_64 &offload_random, FILE *samples) {
+                            std::mt19937_64 &offload_random, FILE *samples,
+                            FILE *switch_parts_file) {
   uint64_t reference_checksum = warm_up(filler);
   int wrong_outputs = 0;
   double filler_median_ns =
       percentile(time_runs(filler, 20, reference_checksum, clock, wrong_outputs), 0.5);
   std::uniform_real_distribution<double> uniform_offload_ns(0, 0.9 * filler_median_ns);
+  double core_ghz = switch_parts_file != nullptr ? measure_core_ghz(clock) : NAN;
 
   FillerFiber fiber;
   CompletionRecordPool records;
@@ -1477,6 +1731,7 @@ static void measure_latency(const char *filler_name, Filler &filler, const Optio
   std::vector<double> latencies_ns;
   std::vector<double> detects_ns;
   std::vector<double> switches_ns;
+  SwitchPartsCollector switch_parts;
   int late_completions = 0;
   for (int run_index = 0; run_index < options.runs; run_index++) {
     double offload_ns =
@@ -1486,6 +1741,9 @@ static void measure_latency(const char *filler_name, Filler &filler, const Optio
     run_counts[static_cast<int>(run.outcome)]++;
     if (!run.output_correct) {
       wrong_outputs++;
+    }
+    if (run.switch_parts) {
+      switch_parts.add(*run.switch_parts, clock);
     }
     double detect_ns = clock.ticks_to_ns(static_cast<double>(run.detect_ticks));
     double switch_ns = clock.ticks_to_ns(static_cast<double>(run.switch_ticks));
@@ -1519,6 +1777,9 @@ static void measure_latency(const char *filler_name, Filler &filler, const Optio
   printf(",%.0f,%.0f,%.0f", percentile(switches_ns, 0.5), percentile(switches_ns, 0.9),
          percentile(switches_ns, 0.99));
   printf(",%.0f\n", filler_median_ns);
+  if (switch_parts_file != nullptr) {
+    switch_parts.write_row(switch_parts_file, options, filler_name, core_ghz);
+  }
 }
 
 // The least detect time. With no filler and no fiber, the filler CPU loads the
@@ -1562,11 +1823,13 @@ static void measure_signal_floor(const Options &options, const TscClock &clock,
 template <typename DeviceOffload>
 static void measure_device_latency(const char *filler_name, Filler &filler, const Options &options,
                                    const TscClock &clock, DeviceOffload &offload,
-                                   CompletionObserver &observer, FILE *samples) {
+                                   CompletionObserver &observer, FILE *samples,
+                                   FILE *switch_parts_file) {
   uint64_t reference_checksum = warm_up(filler);
   int wrong_outputs = 0;
   double filler_median_ns =
       percentile(time_runs(filler, 20, reference_checksum, clock, wrong_outputs), 0.5);
+  double core_ghz = switch_parts_file != nullptr ? measure_core_ghz(clock) : NAN;
 
   FillerFiber fiber;
   for (int run_index = 0; run_index < warmup_runs; run_index++) {
@@ -1581,6 +1844,7 @@ static void measure_device_latency(const char *filler_name, Filler &filler, cons
   std::vector<double> latencies_ns;
   std::vector<double> detects_ns;
   std::vector<double> switches_ns;
+  SwitchPartsCollector switch_parts;
   std::map<int, uint64_t> interrupts_before =
       read_device_interrupts_per_cpu(DeviceOffload::interrupt_name);
   InvoluntarySwitchCounter involuntary_switches(observer);
@@ -1590,6 +1854,9 @@ static void measure_device_latency(const char *filler_name, Filler &filler, cons
     run_counts[static_cast<int>(run.outcome)]++;
     if (!run.output_correct) {
       wrong_outputs++;
+    }
+    if (run.switch_parts) {
+      switch_parts.add(*run.switch_parts, clock);
     }
     if (!run.offload_output_correct) {
       failed_offloads++;
@@ -1638,6 +1905,45 @@ static void measure_device_latency(const char *filler_name, Filler &filler, cons
          percentile(switches_ns, 0.99));
   printf(",%.0f,%" PRIu64 ",%" PRIu64 "\n", filler_median_ns, filler_involuntary_switches,
          observer_involuntary_switches);
+  if (switch_parts_file != nullptr) {
+    switch_parts.write_row(switch_parts_file, options, filler_name, core_ghz);
+  }
+}
+
+// The least switch time: the switch of a fiber that does nothing but yield,
+// so the store buffer holds no filler stores and the code and the contexts
+// stay in the cache. Prints one row; with --switch-parts, also writes a parts
+// row with the filler name yield-loop.
+static void measure_switch_floor(const Options &options, const TscClock &clock,
+                                 FILE *switch_parts_file) {
+  double core_ghz = measure_core_ghz(clock);
+  FillerFiber fiber;
+  fcontext_t fiber_context = fiber.new_context(yield_loop_fiber_entry);
+  std::vector<double> switches_ns;
+  SwitchPartsCollector switch_parts;
+  inside_filler_fiber = true;
+  for (int run_index = 0; run_index < warmup_runs + options.runs; run_index++) {
+    fcontext_transfer_t from_fiber = fcontext_swap(fiber_context, nullptr);
+    uint64_t scheduler_resumed_tsc = read_tsc();
+    fiber_context = from_fiber.prev_context;
+    uint64_t stopped_tsc = filler_stopped_tsc;
+    if (run_index < warmup_runs) {
+      continue;
+    }
+    switches_ns.push_back(
+        clock.ticks_to_ns(static_cast<double>(scheduler_resumed_tsc - stopped_tsc)));
+    if (stamping_switch_parts) {
+      switch_parts.add(switch_parts_of_yield(stopped_tsc, scheduler_resumed_tsc), clock);
+    }
+  }
+  inside_filler_fiber = false;
+  printf("%s,%d,%s,%d,%d,%.2f,%.1f,%.1f,%.1f,%.1f\n", options.mode.c_str(), options.cpu,
+         yield_jump_name(options.yield_jump), stamping_switch_parts ? 1 : 0, options.runs,
+         core_ghz, percentile(switches_ns, 0.5), percentile(switches_ns, 0.1),
+         percentile(switches_ns, 0.9), percentile(switches_ns, 0.99));
+  if (switch_parts_file != nullptr) {
+    switch_parts.write_row(switch_parts_file, options, "yield-loop", core_ghz);
+  }
 }
 
 // The least detect time of qat-latency and dsa-latency. With no filler and no
@@ -1856,12 +2162,13 @@ static void measure_qat_interrupt(const Options &options, const TscClock &clock,
 static void print_usage(FILE *stream) {
   fprintf(stream,
           "usage: preempt_bench --mode overhead|latency|signal-floor|qat-latency|qat-floor|\n"
-          "                            qat-interrupt|dsa-latency|dsa-floor [options]\n"
+          "                            qat-interrupt|dsa-latency|dsa-floor|switch-floor\n"
+          "                            [options]\n"
           "  --filler NAME        a filler, or all (default); repeat for more than one\n"
           "  --size BYTES         input size of each filler, a multiple of 64 (default 65536)\n"
           "  --runs N             measured runs (default 2000 overhead, 1000 latency,\n"
           "                       qat-latency and dsa-latency, 10000 signal-floor,\n"
-          "                       qat-floor, qat-interrupt and dsa-floor)\n"
+          "                       qat-floor, qat-interrupt, dsa-floor and switch-floor)\n"
           "  --cpu N              CPU of the filler (default 2)\n"
           "  --accelerator-cpu N  CPU of the emulated accelerator (default 4)\n"
           "  --observer-cpu N     qat and dsa modes: CPU of the completion observer\n"
@@ -1878,6 +2185,13 @@ static void print_usage(FILE *stream) {
           "                       (default 1)\n"
           "  --samples PATH       latency, qat-latency and dsa-latency modes: also write\n"
           "                       each run to PATH\n"
+          "  --switch-parts PATH  latency, qat-latency, dsa-latency and switch-floor modes:\n"
+          "                       cut the switch of each yield into parts with TSC stamps,\n"
+          "                       and write one row of part medians a filler to PATH\n"
+          "  --yield-jump J       the jump of do_yield to the scheduler: boost (default;\n"
+          "                       jump_fcontext), own-copy (a copy of jump_fcontext that\n"
+          "                       only do_yield calls) or no-fpu-control-load\n"
+          "                       (jump_fcontext without ldmxcsr and fldcw)\n"
           "  --ipp-code-path P    GCM code of ipp-crypto: native (default; VAES assembly on\n"
           "                       AVX-512 CPUs), aesni (AES-NI assembly), or portable-c\n"
           "                       (table C code, which has probe points in its block loop)\n"
@@ -1913,6 +2227,8 @@ static Options parse_options(int argc, char **argv) {
     offload_ns_option,
     seed_option,
     samples_option,
+    switch_parts_option,
+    yield_jump_option,
     ipp_code_path_option,
     no_header_option,
     help_option
@@ -1931,6 +2247,8 @@ static Options parse_options(int argc, char **argv) {
       {"offload-ns", required_argument, nullptr, offload_ns_option},
       {"seed", required_argument, nullptr, seed_option},
       {"samples", required_argument, nullptr, samples_option},
+      {"switch-parts", required_argument, nullptr, switch_parts_option},
+      {"yield-jump", required_argument, nullptr, yield_jump_option},
       {"ipp-code-path", required_argument, nullptr, ipp_code_path_option},
       {"no-header", no_argument, nullptr, no_header_option},
       {"help", no_argument, nullptr, help_option},
@@ -1978,6 +2296,21 @@ static Options parse_options(int argc, char **argv) {
       case samples_option:
         options.samples_path = optarg;
         break;
+      case switch_parts_option:
+        options.switch_parts_path = optarg;
+        break;
+      case yield_jump_option:
+        if (strcmp(optarg, "boost") == 0) {
+          options.yield_jump = YieldJump::boost;
+        } else if (strcmp(optarg, "own-copy") == 0) {
+          options.yield_jump = YieldJump::own_copy;
+        } else if (strcmp(optarg, "no-fpu-control-load") == 0) {
+          options.yield_jump = YieldJump::no_fpu_control_load;
+        } else {
+          fprintf(stderr, "--yield-jump must be boost, own-copy or no-fpu-control-load\n");
+          exit(2);
+        }
+        break;
       case ipp_code_path_option:
         options.ipp_code_path = optarg;
         break;
@@ -1996,8 +2329,17 @@ static Options parse_options(int argc, char **argv) {
                   options.mode == "qat-interrupt";
   bool dsa_mode = options.mode == "dsa-latency" || options.mode == "dsa-floor";
   if (options.mode != "overhead" && options.mode != "latency" && options.mode != "signal-floor" &&
-      !qat_mode && !dsa_mode) {
+      options.mode != "switch-floor" && !qat_mode && !dsa_mode) {
     print_usage(stderr);
+    exit(2);
+  }
+  bool mode_has_switch = options.mode == "latency" || options.mode == "qat-latency" ||
+                         options.mode == "dsa-latency" || options.mode == "switch-floor";
+  if (!mode_has_switch &&
+      (!options.switch_parts_path.empty() || options.yield_jump != YieldJump::boost)) {
+    fprintf(stderr,
+            "--switch-parts and --yield-jump are for latency, qat-latency, dsa-latency and "
+            "switch-floor modes\n");
     exit(2);
   }
   if (options.size_bytes == 0 || options.size_bytes % 64 != 0 || options.size_bytes > (1u << 30)) {
@@ -2126,7 +2468,7 @@ static void run_device_floor(const Options &options, const TscClock &clock,
 
 template <typename DeviceOffload>
 static void run_device_latency(const Options &options, const TscClock &clock,
-                               DeviceOffload &offload) {
+                               DeviceOffload &offload, FILE *switch_parts_file) {
   FILE *samples = open_samples_file(
       options.samples_path,
       "probe_interval,ipp_code_path,filler,size_bytes,offload_bytes,run,submit_ns,offload_ns,"
@@ -2138,7 +2480,8 @@ static void run_device_latency(const Options &options, const TscClock &clock,
   for (const std::string &name : options.filler_names) {
     std::mt19937_64 input_random(options.seed);
     std::unique_ptr<Filler> filler = find_filler_kind(name)->make(options.size_bytes, input_random);
-    measure_device_latency(name.c_str(), *filler, options, clock, offload, observer, samples);
+    measure_device_latency(name.c_str(), *filler, options, clock, offload, observer, samples,
+                           switch_parts_file);
     fflush(stdout);
   }
   if (samples != nullptr) {
@@ -2151,6 +2494,25 @@ int main(int argc, char **argv) {
   select_ipp_code_path(options.ipp_code_path);
   pin_current_thread_to_cpu(options.cpu);
   TscClock clock = TscClock::calibrate();
+  // The fillers and the fibers run on this thread, so these thread_local
+  // flags are the ones do_yield reads.
+  yield_jump = options.yield_jump;
+  stamping_switch_parts = !options.switch_parts_path.empty();
+  switch_experiment_active = stamping_switch_parts || yield_jump != YieldJump::boost;
+  FILE *switch_parts_file = open_samples_file(options.switch_parts_path, switch_parts_header);
+
+  if (options.mode == "switch-floor") {
+    if (options.print_header) {
+      printf(
+          "mode,cpu,yield_jump,switch_parts,runs,core_ghz,switch_median_ns,switch_p10_ns,"
+          "switch_p90_ns,switch_p99_ns\n");
+    }
+    measure_switch_floor(options, clock, switch_parts_file);
+    if (switch_parts_file != nullptr) {
+      fclose(switch_parts_file);
+    }
+    return 0;
+  }
 
   if (options.mode == "overhead") {
     if (options.print_header) {
@@ -2186,7 +2548,10 @@ int main(int argc, char **argv) {
     if (options.mode == "qat-floor") {
       run_device_floor(options, clock, offload);
     } else {
-      run_device_latency(options, clock, offload);
+      run_device_latency(options, clock, offload, switch_parts_file);
+    }
+    if (switch_parts_file != nullptr) {
+      fclose(switch_parts_file);
     }
     return 0;
   }
@@ -2217,7 +2582,10 @@ int main(int argc, char **argv) {
     if (options.mode == "dsa-floor") {
       run_device_floor(options, clock, offload);
     } else {
-      run_device_latency(options, clock, offload);
+      run_device_latency(options, clock, offload, switch_parts_file);
+    }
+    if (switch_parts_file != nullptr) {
+      fclose(switch_parts_file);
     }
     return 0;
   }
@@ -2241,11 +2609,15 @@ int main(int argc, char **argv) {
     std::mt19937_64 input_random(options.seed);
     std::unique_ptr<Filler> filler = find_filler_kind(name)->make(options.size_bytes, input_random);
     std::mt19937_64 offload_random(options.seed);
-    measure_latency(name.c_str(), *filler, options, clock, accelerator, offload_random, samples);
+    measure_latency(name.c_str(), *filler, options, clock, accelerator, offload_random, samples,
+                    switch_parts_file);
     fflush(stdout);
   }
   if (samples != nullptr) {
     fclose(samples);
+  }
+  if (switch_parts_file != nullptr) {
+    fclose(switch_parts_file);
   }
   return 0;
 }

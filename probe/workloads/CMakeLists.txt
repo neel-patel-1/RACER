@@ -67,6 +67,7 @@ racer_probe_all_sources(racer_router_proto)
 
 add_executable(preempt_bench
   preempt_bench.cpp
+  jump_fcontext_variants.S
   "${RACER_ROOT}/src/jump_x86_64_sysv_elf_gas.S"
   "${RACER_ROOT}/src/make_x86_64_sysv_elf_gas.S"
   "${RACER_ROOT}/src/ontop_x86_64_sysv_elf_gas.S")
